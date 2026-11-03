@@ -44,6 +44,15 @@ pub struct Book {
     pub listing_status: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub textbook_classifications: Vec<TextbookClassification>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextbookClassification {
+    pub textbook_level: String,
+    pub applicable_major: String,
+    pub category: String,
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +148,12 @@ pub struct BookPatch {
     pub stock: Option<i64>,
     pub status: Option<String>,
     pub note: Option<String>,
+    #[serde(alias = "教材分级")]
+    pub textbook_level: Option<String>,
+    #[serde(alias = "适用专业")]
+    pub applicable_major: Option<String>,
+    #[serde(alias = "类别")]
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,6 +196,32 @@ pub struct Settings {
     pub auto_submit: bool,
     pub publish_url: String,
     pub kongfz_url: String,
+    #[serde(default)]
+    pub xianyu_publish_defaults: XianyuPublishDefaults,
+    #[serde(default = "default_trusted_shops")]
+    pub source_shop_whitelist: Vec<String>,
+}
+
+pub fn default_trusted_shops() -> Vec<String> {
+    ["旧书云 西南旧书城", "旧书云", "西南旧书城", "小谷吖书店", "鑫博雅二手教材书店", "南工大书店"].into_iter().map(str::to_string).collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct XianyuPublishDefaults {
+    pub channel_cat_id: String,
+    pub province: i64,
+    pub city: i64,
+    pub district: i64,
+    pub stock: i64,
+    pub stuff_status: i64,
+    pub channel_cat_name: String,
+}
+
+impl Default for XianyuPublishDefaults {
+    fn default() -> Self {
+        Self { channel_cat_id: String::new(), channel_cat_name: "教材教辅".into(), province: 330000, city: 330100, district: 330101, stock: 9999, stuff_status: 90 }
+    }
 }
 
 impl Default for Settings {
@@ -194,6 +235,8 @@ impl Default for Settings {
             auto_submit: true,
             publish_url: "https://seller.goofish.com/?site=COMMONPRO#/seller-item/publish".into(),
             kongfz_url: "https://search.kongfz.com/product_result/".into(),
+            xianyu_publish_defaults: XianyuPublishDefaults::default(),
+            source_shop_whitelist: default_trusted_shops(),
         }
     }
 }

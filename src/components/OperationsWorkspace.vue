@@ -568,14 +568,14 @@ defineExpose({ refresh, openOrder });
               author: '作者',
               publisher: '出版社',
               isbn: 'ISBN',
-              edition: '版次',
+              edition: '版次（选填）',
               volume: '册次',
               publicationYear: '出版年份',
             }"
             :key="key"
             class="field"
             ><span>{{ label }}</span
-            ><input v-model="confirmation.book[key]" :required="key === 'title'" class="input"
+            ><input v-model="confirmation.book[key]" :required="key === 'title'" class="input" :placeholder="key === 'edition' ? '例如：第一版、第2版' : undefined"
           /></label>
         </div>
         <label class="xy-check"

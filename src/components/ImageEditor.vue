@@ -9,6 +9,7 @@ import {
   watch,
 } from "vue";
 import { assetUrl } from "../api";
+import { drawCrop, moveCrop, resizeCrop } from "../image-crop";
 
 const props = defineProps({
   image: { type: Object, required: true },
@@ -16,17 +17,26 @@ const props = defineProps({
 const emit = defineEmits(["close", "saved"]);
 
 const canvasRef = ref(null);
+const viewportRef = ref(null);
+const imageSize = reactive({ w: 0, h: 0 });
+const viewportSize = reactive({ w: 0, h: 0 });
 const loading = ref(true);
 const busy = ref(false);
 const status = ref("");
-const tool = ref("brush");
+const tool = ref("crop");
 const brushSize = ref(44);
 const showMask = ref(true);
 const band = ref(38);
 const threshold = ref(14);
 const enhance = ref(true);
 const maskCount = ref(0);
-const crop = reactive({ top: 0, bottom: 0, left: 0, right: 0 });
+const crop = reactive({ x: 0, y: 0, w: 0, h: 0 });
+const history = ref([]);
+const corners = { nw: '左上角', ne: '右上角', sw: '左下角', se: '右下角' };
+let cropGesture = null;
+let activePointer = null;
+let resizeObserver;
+let disposed = false;
 
 let work = null;
 let workCtx = null;
@@ -35,35 +45,35 @@ let maskCtx = null;
 let mask = null;
 let width = 0;
 let height = 0;
-let history = [];
 let painting = false;
 let lastPoint = null;
 
-const cropRect = computed(() => {
-  const x = Math.round((width * crop.left) / 100);
-  const y = Math.round((height * crop.top) / 100);
-  const w = Math.max(
-    8,
-    Math.round((width * (100 - crop.left - crop.right)) / 100),
-  );
-  const h = Math.max(
-    8,
-    Math.round((height * (100 - crop.top - crop.bottom)) / 100),
-  );
-  return { x, y, w: Math.min(w, width - x), h: Math.min(h, height - y) };
-});
+const cropRect = computed(() => ({ ...crop }));
+const displayScale = computed(() => imageSize.w && imageSize.h
+  ? Math.max(0.01, Math.min(1, (viewportSize.w - 40) / imageSize.w, (viewportSize.h - 40) / imageSize.h)) : 1);
+const imageStyle = computed(() => ({ width: `${imageSize.w * displayScale.value}px`, height: `${imageSize.h * displayScale.value}px` }));
+const cropStyle = computed(() => imageSize.w ? ({
+  left: `${crop.x / imageSize.w * 100}%`, top: `${crop.y / imageSize.h * 100}%`,
+  width: `${crop.w / imageSize.w * 100}%`, height: `${crop.h / imageSize.h * 100}%`,
+}) : {});
 
-onMounted(load);
+onMounted(() => {
+  resizeObserver = new ResizeObserver(([entry]) => {
+    viewportSize.w = entry.contentRect.width;
+    viewportSize.h = entry.contentRect.height;
+  });
+  resizeObserver.observe(viewportRef.value);
+  window.addEventListener('blur', pointerUp);
+  load();
+});
 onBeforeUnmount(() => {
-  window.removeEventListener("keydown", onKey);
+  disposed = true;
+  resizeObserver?.disconnect();
+  window.removeEventListener('blur', pointerUp);
+  pointerUp();
 });
-
-function onKey(event) {
-  if (event.key === "Escape") emit("close");
-}
 
 async function load() {
-  window.addEventListener("keydown", onKey);
   const image = new Image();
   image.crossOrigin = "anonymous";
   const source = props.image.processedUrl || props.image.url;
@@ -78,6 +88,7 @@ async function load() {
     loading.value = false;
     return;
   }
+  if (disposed) return;
 
   const max = 1400;
   const scale = Math.min(
@@ -86,6 +97,8 @@ async function load() {
   );
   width = Math.max(1, Math.round(image.naturalWidth * scale));
   height = Math.max(1, Math.round(image.naturalHeight * scale));
+  Object.assign(imageSize, { w: width, h: height });
+  Object.assign(crop, { x: 0, y: 0, w: width, h: height });
 
   work = document.createElement("canvas");
   work.width = width;
@@ -126,10 +139,10 @@ function draw() {
   ctx.fillRect(0, rect.y + rect.h, width, height - (rect.y + rect.h));
   ctx.fillRect(0, rect.y, rect.x, rect.h);
   ctx.fillRect(rect.x + rect.w, rect.y, width - (rect.x + rect.w), rect.h);
-  ctx.strokeStyle = "#f3b562";
+  ctx.strokeStyle = "#137d72";
   ctx.lineWidth = Math.max(2, width / 480);
   ctx.setLineDash([14, 9]);
-  ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+  if (tool.value !== 'crop') ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
   ctx.restore();
 }
 
@@ -143,7 +156,12 @@ function pointOf(event) {
 }
 
 function pointerDown(event) {
-  if (loading.value || busy.value) return;
+  if (loading.value || busy.value || !work || activePointer || event.button !== 0) return;
+  if (tool.value === 'crop') {
+    startCrop(event, 'draw');
+    return;
+  }
+  activePointer = { id: event.pointerId, element: event.currentTarget };
   painting = true;
   canvasRef.value.setPointerCapture(event.pointerId);
   pushHistory();
@@ -154,6 +172,17 @@ function pointerDown(event) {
 }
 
 function pointerMove(event) {
+  if (activePointer?.id !== event.pointerId) return;
+  if (cropGesture) {
+    const point = pointOf(event);
+    const { start, rect, mode } = cropGesture;
+    const dx = point.x - start.x, dy = point.y - start.y;
+    if (mode === 'draw' && Math.hypot(dx, dy) < 3) return;
+    Object.assign(crop, mode === 'move' ? moveCrop(rect, dx, dy, width, height)
+      : mode === 'draw' ? drawCrop(start, point, width, height)
+        : resizeCrop(rect, mode, dx, dy, width, height));
+    return;
+  }
   if (!painting) return;
   const point = pointOf(event);
   const from = lastPoint || point;
@@ -171,11 +200,43 @@ function pointerMove(event) {
   draw();
 }
 
-function pointerUp() {
-  if (!painting) return;
+function pointerUp(event) {
+  if (event?.pointerId != null && activePointer?.id !== event.pointerId) return;
+  const pointer = activePointer;
+  activePointer = null;
+  cropGesture = null;
+  if (pointer?.element.hasPointerCapture(pointer.id)) pointer.element.releasePointerCapture(pointer.id);
+  if (painting) countMask();
   painting = false;
   lastPoint = null;
-  countMask();
+}
+
+function startCrop(event, mode) {
+  if (busy.value || loading.value || !work || activePointer || event.button !== 0) return;
+  event.preventDefault();
+  event.currentTarget.focus();
+  activePointer = { id: event.pointerId, element: event.currentTarget };
+  event.currentTarget.setPointerCapture(event.pointerId);
+  cropGesture = { start: pointOf(event), rect: { ...crop }, mode };
+  pushHistory();
+}
+
+function cropKey(event, mode) {
+  const directions = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+  const direction = directions[event.key];
+  if (!direction || busy.value || loading.value) return;
+  event.preventDefault();
+  pushHistory();
+  const step = event.shiftKey ? 10 : 1;
+  Object.assign(crop, mode === 'move'
+    ? moveCrop(crop, direction[0] * step, direction[1] * step, width, height)
+    : resizeCrop(crop, mode, direction[0] * step, direction[1] * step, width, height));
+}
+
+function resetCrop() {
+  if (!work) return;
+  pushHistory();
+  Object.assign(crop, { x: 0, y: 0, w: width, h: height });
 }
 
 function stamp(x, y) {
@@ -211,26 +272,25 @@ function stamp(x, y) {
 }
 
 function pushHistory() {
-  history.push(new Uint8Array(mask));
-  if (history.length > 6) history.shift();
+  history.value.push({ mask: new Uint8Array(mask), crop: { ...crop } });
+  if (history.value.length > 6) history.value.shift();
 }
 
 function undo() {
-  const previous = history.pop();
+  const previous = history.value.pop();
   if (!previous) return;
-  mask.set(previous);
+  mask.set(previous.mask);
+  Object.assign(crop, previous.crop);
   rebuildMaskCanvas();
   draw();
   countMask();
 }
 
 function resetAll() {
+  if (!work) return;
   mask.fill(0);
-  history = [];
-  crop.top = 0;
-  crop.bottom = 0;
-  crop.left = 0;
-  crop.right = 0;
+  history.value = [];
+  Object.assign(crop, { x: 0, y: 0, w: width, h: height });
   enhance.value = true;
   rebuildMaskCanvas();
   draw();
@@ -261,7 +321,7 @@ function rebuildMaskCanvas() {
 }
 
 async function detect() {
-  if (loading.value || busy.value) return;
+  if (loading.value || busy.value || !work) return;
   busy.value = true;
   status.value = "正在识别半透明水印…";
   await new Promise((resolve) => setTimeout(resolve, 40));
@@ -333,7 +393,7 @@ async function detect() {
 }
 
 async function save() {
-  if (busy.value) return;
+  if (busy.value || loading.value || !work || activePointer) return;
   busy.value = true;
   status.value = "正在修补并导出…";
   await new Promise((resolve) => setTimeout(resolve, 40));
@@ -509,17 +569,8 @@ function applyEnhance(ctx, w, h) {
   ctx.putImageData(imageData, 0, 0);
 }
 
-watch(
-  [() => crop.top, () => crop.bottom, () => crop.left, () => crop.right],
-  () => {
-    const clamp = (value) => Math.max(0, Math.min(45, Number(value) || 0));
-    if (crop.left + crop.right > 88) crop.right = 88 - crop.left;
-    if (crop.top + crop.bottom > 88) crop.bottom = 88 - crop.top;
-    crop.left = clamp(crop.left);
-    crop.top = clamp(crop.top);
-    draw();
-  },
-);
+watch(crop, draw);
+watch(tool, () => { pointerUp(); draw(); });
 
 watch(showMask, draw);
 </script>
@@ -552,29 +603,41 @@ watch(showMask, draw);
       <div class="editor-body">
         <div class="canvas-pane">
           <div v-if="loading" class="canvas-loading">加载图片…</div>
-          <canvas
-            ref="canvasRef"
-            @pointerdown="pointerDown"
-            @pointermove="pointerMove"
-            @pointerup="pointerUp"
-            @pointercancel="pointerUp"
-          />
+          <div ref="viewportRef" class="crop-viewport">
+            <div class="crop-image" :style="imageStyle"
+              @pointermove="pointerMove" @pointerup="pointerUp"
+              @pointercancel="pointerUp" @lostpointercapture="pointerUp">
+              <canvas ref="canvasRef" aria-label="图书图片，使用裁切框四角调整范围" @pointerdown="pointerDown" />
+              <div v-if="!loading && imageSize.w && tool === 'crop'" class="crop-selection" :style="cropStyle"
+                tabindex="0" role="group" aria-label="移动裁切区域，方向键微调，Shift 加速"
+                @pointerdown.stop="startCrop($event, 'move')" @keydown="cropKey($event, 'move')">
+                <span class="crop-grid" aria-hidden="true"></span>
+                <button v-for="(label, corner) in corners" :key="corner" type="button"
+                  :class="['crop-handle', corner]" :aria-label="`调整裁切${label}，方向键微调`" :disabled="busy"
+                  @pointerdown.stop="startCrop($event, corner)" @keydown.stop="cropKey($event, corner)"></button>
+              </div>
+            </div>
+          </div>
           <div class="canvas-tools">
+            <UiButton :class="['tool-btn', { active: tool === 'crop' }]" :aria-pressed="tool === 'crop'"
+              :disabled="loading || busy || !imageSize.w" @click="tool = 'crop'">裁切</UiButton>
             <UiButton
               :class="['tool-btn', { active: tool === 'brush' }]"
               @click="tool = 'brush'"
+              :disabled="loading || busy || !imageSize.w"
               >画笔</UiButton
             >
             <UiButton
               :class="['tool-btn', { active: tool === 'erase' }]"
               @click="tool = 'erase'"
+              :disabled="loading || busy || !imageSize.w"
               >橡皮</UiButton
             >
-            <UiButton class="tool-btn" :disabled="!history.length" @click="undo"
+            <UiButton class="tool-btn" :disabled="!history.length || busy" @click="undo"
               >撤销</UiButton
             >
-            <UiButton class="tool-btn" @click="resetAll">重置</UiButton>
-            <label class="brush-size">
+            <UiButton class="tool-btn" :disabled="loading || busy || !imageSize.w" @click="resetAll">重置</UiButton>
+            <label v-if="tool !== 'crop'" class="brush-size">
               笔刷
               <input
                 v-model.number="brushSize"
@@ -583,15 +646,22 @@ watch(showMask, draw);
                 max="140"
               />
             </label>
-            <label class="brush-size">
+            <label v-if="tool !== 'crop'" class="brush-size">
               <input v-model="showMask" type="checkbox" />
               显示标记
             </label>
-            <span class="mask-count">{{ maskCount }} px</span>
+            <span v-if="tool !== 'crop'" class="mask-count">{{ maskCount }} px</span>
+            <span v-else class="crop-help">拖动四角调整范围，框内拖动位置</span>
           </div>
         </div>
 
         <aside class="editor-side">
+          <section>
+            <h4>裁切范围</h4>
+            <p class="crop-dimensions">{{ crop.w }} × {{ crop.h }} px</p>
+            <p class="hint">拖动四个角裁切，方向键可微调；保存后显示裁切后的图片。</p>
+            <UiButton class="btn small" :disabled="loading || busy || !imageSize.w" @click="resetCrop">恢复整图</UiButton>
+          </section>
           <section>
             <h4>自动识别水印</h4>
             <label class="field">
@@ -604,40 +674,10 @@ watch(showMask, draw);
             </label>
             <UiButton
               class="btn small"
-              :disabled="loading || busy"
+              :disabled="loading || busy || !imageSize.w"
               @click="detect"
               >识别并标记</UiButton
             >
-          </section>
-
-          <section>
-            <h4>裁剪</h4>
-            <label class="field">
-              <span>上 {{ crop.top }}%</span>
-              <input v-model.number="crop.top" type="range" min="0" max="40" />
-            </label>
-            <label class="field">
-              <span>下 {{ crop.bottom }}%</span>
-              <input
-                v-model.number="crop.bottom"
-                type="range"
-                min="0"
-                max="40"
-              />
-            </label>
-            <label class="field">
-              <span>左 {{ crop.left }}%</span>
-              <input v-model.number="crop.left" type="range" min="0" max="40" />
-            </label>
-            <label class="field">
-              <span>右 {{ crop.right }}%</span>
-              <input
-                v-model.number="crop.right"
-                type="range"
-                min="0"
-                max="40"
-              />
-            </label>
           </section>
 
           <section>
@@ -654,7 +694,7 @@ watch(showMask, draw);
             <p v-if="status" class="status-line" role="status">{{ status }}</p>
             <UiButton
               class="btn accent block"
-              :disabled="busy || loading"
+              :disabled="busy || loading || !imageSize.w"
               @click="save"
             >
               {{ busy ? "处理中…" : "保存图片" }}
@@ -665,3 +705,25 @@ watch(showMask, draw);
     </div>
   </div>
 </template>
+
+<style scoped>
+.crop-viewport { flex: 1; min-height: 0; overflow: auto; display: grid; place-items: center; padding: 20px; }
+.crop-image { position: relative; flex-shrink: 0; }
+.crop-image canvas { width: 100%; height: 100%; max-width: none; max-height: none; margin: 0; }
+.crop-selection { position: absolute; border: 2px solid #fff; outline: 1px solid #137d72; cursor: move; touch-action: none; }
+.crop-selection:focus-visible { outline: 3px solid #137d72; outline-offset: 3px; }
+.crop-grid { position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(to right, transparent calc(100% / 3 - 0.5px), #ffffff80 calc(100% / 3), transparent calc(100% / 3 + 0.5px), transparent calc(200% / 3 - 0.5px), #ffffff80 calc(200% / 3), transparent calc(200% / 3 + 0.5px)),
+    linear-gradient(to bottom, transparent calc(100% / 3 - 0.5px), #ffffff80 calc(100% / 3), transparent calc(100% / 3 + 0.5px), transparent calc(200% / 3 - 0.5px), #ffffff80 calc(200% / 3), transparent calc(200% / 3 + 0.5px)); }
+.crop-handle { position: absolute; width: 28px; height: 28px; padding: 0; background: transparent; border: 0; touch-action: none; }
+.crop-handle::after { content: ''; position: absolute; inset: 7px; border: 2px solid #137d72; background: #fff; }
+.crop-handle:hover::after, .crop-handle:focus-visible::after { background: #e9f4f1; }
+.crop-handle.nw { left: 0; top: 0; transform: translate(-50%, -50%); cursor: nwse-resize; }
+.crop-handle.ne { right: 0; top: 0; transform: translate(50%, -50%); cursor: nesw-resize; }
+.crop-handle.sw { left: 0; bottom: 0; transform: translate(-50%, 50%); cursor: nesw-resize; }
+.crop-handle.se { right: 0; bottom: 0; transform: translate(50%, 50%); cursor: nwse-resize; }
+.crop-help { color: var(--muted); font-size: 12px; }
+.crop-dimensions { font-variant-numeric: tabular-nums; margin-bottom: 8px; }
+.canvas-pane { min-height: 180px; }
+@media (max-width: 800px) { .canvas-pane { flex: 1; } .editor-side { flex-shrink: 0; max-height: 38%; } .crop-help { width: 100%; } }
+</style>

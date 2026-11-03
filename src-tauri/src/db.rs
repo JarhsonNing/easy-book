@@ -6,11 +6,13 @@ use crate::models::*;
 
 pub const BOOK_SELECT: &str = "
   SELECT b.*,
+    (SELECT json_group_array(json_object('textbookLevel',tc.textbook_level,'applicableMajor',tc.applicable_major,'category',tc.category))
+       FROM book_textbook_classifications tc WHERE tc.book_id=b.id) AS textbook_classifications,
     (SELECT COUNT(*) FROM images i WHERE i.book_id = b.id) AS image_count,
     (SELECT i.id FROM images i WHERE i.book_id = b.id
        ORDER BY i.is_primary DESC, i.sort ASC, i.id ASC LIMIT 1) AS cover_id,
-    (SELECT CASE WHEN i.processed_file <> '' THEN 1 ELSE 0 END FROM images i WHERE i.book_id = b.id
-       ORDER BY i.is_primary DESC, i.sort ASC, i.id ASC LIMIT 1) AS cover_processed,
+    (SELECT i.processed_file FROM images i WHERE i.book_id = b.id
+       ORDER BY i.is_primary DESC, i.sort ASC, i.id ASC LIMIT 1) AS cover_file,
     (SELECT l.id FROM listings l WHERE l.book_id = b.id ORDER BY l.id DESC LIMIT 1) AS listing_id,
     (SELECT l.status FROM listings l WHERE l.book_id = b.id ORDER BY l.id DESC LIMIT 1) AS listing_status
   FROM books b";
@@ -186,6 +188,14 @@ pub fn settings(conn: &Connection) -> Settings {
     if let Some(Json::Bool(flag)) = get_setting(conn, "autoSubmit") {
         value.auto_submit = flag;
     }
+    if let Some(defaults) = get_setting(conn, "xianyuPublishDefaults") {
+        if defaults.get("stock").is_some() {
+            value.xianyu_publish_defaults = serde_json::from_value(defaults).unwrap_or_default();
+        }
+    }
+    if let Some(shops) = get_setting(conn, "sourceShopWhitelist") {
+        value.source_shop_whitelist = serde_json::from_value(shops).unwrap_or_else(|_| default_trusted_shops());
+    }
     value
 }
 
@@ -193,6 +203,32 @@ pub fn save_settings(conn: &Connection, patch: &Json) -> rusqlite::Result<Settin
     if let Some(object) = patch.as_object() {
         for (key, value) in object {
             match key.as_str() {
+                "sourceShopWhitelist" => {
+                    if let Some(shops) = value.as_array() {
+                        let shops: Vec<_> = shops.iter().filter_map(Json::as_str).map(str::trim).filter(|s| !s.is_empty()).collect();
+                        set_setting(conn, key, &json!(shops))?;
+                    }
+                }
+                "xianyuPublishDefaults" => {
+                    let defaults: crate::models::XianyuPublishDefaults =
+                        serde_json::from_value(value.clone())
+                            .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+                    if !(1..=9999).contains(&defaults.stock) || ![0,100,-1,99,95,90,80,70,60,50].contains(&defaults.stuff_status) {
+                        return Err(rusqlite::Error::InvalidParameterName("默认库存或成色无效".into()));
+                    }
+                    if (defaults.province != 0 || defaults.city != 0 || defaults.district != 0)
+                        && !crate::regions::valid(
+                            defaults.province,
+                            defaults.city,
+                            defaults.district,
+                        )
+                    {
+                        return Err(rusqlite::Error::InvalidParameterName(
+                            "请选择完整且匹配的默认省、市、区".into(),
+                        ));
+                    }
+                    set_setting(conn, key, &json!(defaults))?;
+                }
                 "profitRate" => {
                     if let Some(number) = value.as_f64() {
                         let clamped = number.clamp(0.0, 100.0);
@@ -257,20 +293,20 @@ fn capture_from_row(row: &Row<'_>) -> rusqlite::Result<Capture> {
     })
 }
 
+fn processed_image_url(id: i64, file: &str) -> String {
+    format!("/api/images/{id}/file?variant=processed&v={:x}", md5::compute(file))
+}
+
 fn book_from_row(row: &Row<'_>) -> rusqlite::Result<Book> {
     let cover_id: Option<i64> = row.get("cover_id")?;
-    let cover_processed: Option<i64> = row.get("cover_processed")?;
+    let cover_file: Option<String> = row.get("cover_file")?;
     let cover_url = cover_id
         .map(|id| {
-            format!(
-                "/api/images/{}/file{}",
-                id,
-                if cover_processed.unwrap_or(0) == 1 {
-                    "?variant=processed"
-                } else {
-                    ""
-                }
-            )
+            if let Some(file) = cover_file.as_deref().filter(|file| !file.is_empty()) {
+                processed_image_url(id, file)
+            } else {
+                format!("/api/images/{id}/file")
+            }
         })
         .unwrap_or_default();
 
@@ -300,6 +336,7 @@ fn book_from_row(row: &Row<'_>) -> rusqlite::Result<Book> {
         cover_url,
         listing_id: row.get("listing_id")?,
         listing_status: row.get("listing_status")?,
+        textbook_classifications: serde_json::from_str(&row.get::<_,String>("textbook_classifications")?).unwrap_or_default(),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -343,7 +380,7 @@ fn image_item(row: ImageRow) -> ImageItem {
         sort: row.sort,
         url: format!("/api/images/{}/file", row.id),
         processed_url: if processed {
-            format!("/api/images/{}/file?variant=processed", row.id)
+            processed_image_url(row.id, &row.processed_file)
         } else {
             String::new()
         },
@@ -698,6 +735,7 @@ pub fn create_book(conn: &Connection, patch: &BookPatch) -> rusqlite::Result<Boo
         ],
     )?;
     let id = conn.last_insert_rowid();
+    save_textbook_classification(conn,id,patch)?;
     crate::agents::ai::auto_queue(conn,id,"book")?;
     get_book(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
@@ -708,6 +746,7 @@ pub fn update_book(
     patch: &BookPatch,
 ) -> rusqlite::Result<Option<Book>> {
     let before=get_book(conn,id)?;
+    if before.is_some() { save_textbook_classification(conn,id,patch)?; }
     let mut sets: Vec<&str> = Vec::new();
     let mut values: Vec<Value> = Vec::new();
 
@@ -760,6 +799,16 @@ pub fn update_book(
     let after=get_book(conn,id)?;
     if before.as_ref().zip(after.as_ref()).is_some_and(|(a,b)|(&a.title,&a.author,&a.publisher,&a.isbn,&a.edition,&a.condition,&a.note)!=(&b.title,&b.author,&b.publisher,&b.isbn,&b.edition,&b.condition,&b.note)){crate::agents::ai::auto_queue(conn,id,"book")?;}
     Ok(after)
+}
+
+pub fn save_textbook_classification(conn: &Connection, id: i64, patch: &BookPatch) -> rusqlite::Result<()> {
+    let level = patch.textbook_level.as_deref().unwrap_or("").trim();
+    let major = patch.applicable_major.as_deref().unwrap_or("").trim();
+    let category = patch.category.as_deref().unwrap_or("").trim();
+    if !level.is_empty() || !major.is_empty() || !category.is_empty() {
+        conn.execute("INSERT OR IGNORE INTO book_textbook_classifications(book_id,textbook_level,applicable_major,category) VALUES(?,?,?,?)",params![id,level,major,category])?;
+    }
+    Ok(())
 }
 
 pub fn book_image_rows(conn: &Connection, book_id: i64) -> rusqlite::Result<Vec<ImageRow>> {

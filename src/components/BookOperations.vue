@@ -256,6 +256,10 @@ function editSource(s = null, primary = false) {
   source.id = s?.id ?? null;
   source.primary = primary || !!s?.primary;
   source.data = { ...emptySource(), ...s?.data };
+  source.data.isbn ||= data.value?.isbn || '';
+  source.data.sku ||= data.value?.isbn || '';
+  source.data.condition ||= '九成新';
+  source.data.freight ??= 0;
   sourceDialog.value = true;
 }
 async function addResource() {

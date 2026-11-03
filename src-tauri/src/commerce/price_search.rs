@@ -184,6 +184,7 @@ pub(super) async fn control(
         if query.trim().is_empty() {
             return Err(ApiError::bad("请先填写书名或 ISBN"));
         }
+        let query = query.trim().to_string();
         v = json!({"bookId":bid,"requestId":format!("{}-{}",chrono::Utc::now().timestamp_millis(),rand::random::<u64>()),"query":query,
             "state":"searching","maxPages":BATCH_LIMIT,"pagesDone":0,"items":[],"error":"","startedAt":db::now()});
         if let Some(req) = ai_request { v["aiRequest"] = req; }
@@ -313,8 +314,10 @@ pub(super) async fn control(
             }
             write(&tx, bid, &v)?;
         }
+        prepare_sources(&tx,bid)?;
         crate::agents::ai::refresh_reference_cost(&tx,bid)?;
     } else if ["page","batch","finish"].contains(&action.as_str()) {
+        prepare_sources(&tx,bid)?;
         crate::agents::ai::auto_queue(&tx,bid,"source")?;
     }
     let result = decorate(&tx, bid, v)?;

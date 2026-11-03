@@ -2,6 +2,14 @@ use serde_json::json;
 
 use crate::models::{suggested_price, Book, ImageItem, ListingInput, Settings};
 
+pub fn title_length(value: &str) -> usize {
+    value.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+pub fn limit_title(value: &str) -> String {
+    let mut length = 0;
+    value.trim().chars().take_while(|c| { length += if c.is_ascii() { 1 } else { 2 }; length <= 60 }).collect()
+}
+
 pub struct BuiltListing {
     pub title: String,
     pub description: String,
@@ -57,12 +65,9 @@ pub fn build(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let title = custom
+    let title = limit_title(&custom
         .map(str::to_string)
-        .unwrap_or_else(|| parts.join(" "))
-        .chars()
-        .take(30)
-        .collect::<String>();
+        .unwrap_or_else(|| parts.join(" ")));
 
     let mut lines: Vec<String> = Vec::new();
     if !base_title.is_empty() {

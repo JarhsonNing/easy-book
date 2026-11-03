@@ -255,8 +255,8 @@ function money(value) {
             <input v-model="form.isbn" class="input mono" placeholder="9787020002207" />
           </label>
           <label class="field">
-            <span>版次</span>
-            <input v-model="form.edition" class="input" placeholder="第 3 版" />
+            <span>版次（选填）</span>
+            <input v-model="form.edition" class="input" placeholder="例如：第一版、第2版" />
           </label>
           <label class="field">
             <span>品相</span>

@@ -47,8 +47,16 @@ try{
   config.provider='qoder';config.model='Fixture-Qoder';config=await api('/agents/ai/config','POST',config);
   assert.equal(config.models.opencode,'fixture/writer');assert.equal(config.models.qoder,'Fixture-Qoder');
   const book=await api('/books','POST',{title:'模拟 · Qoder 图书',edition:'第5版',sellPrice:20,stock:0});
-  for(const [i,price] of [1,10].entries())await api('/commerce/sources','POST',{bookId:book.id,primary:false,data:{url:'https://item.taobao.com/item.htm?id='+(10001+i),title:'模拟报价',sku:'第5版',condition:'九成新',price,freight:2,status:'available',dropship:true,checkedAt:'2026-10-29'}});
+  for(const [i,price] of [1,10].entries())await api('/commerce/sources','POST',{bookId:book.id,primary:i===1,data:{url:'https://item.taobao.com/item.htm?id='+(10001+i),title:'模拟报价',sku:'第5版',condition:'九成新',price,freight:2,status:'available',dropship:true,checkedAt:'2026-10-29'}});
+  await api('/commerce/sources','POST',{bookId:book.id,primary:false,data:{url:'https://item.taobao.com/item.htm?id=10003',title:'模拟未选报价',sku:'第5版',condition:'九成新',price:5,freight:0,status:'available',checkedAt:'2026-10-29'}});
+  assert.equal((await api('/books/'+book.id)).costPrice,10,'unselected second-lowest quote must not set book cost');
   const complete=await api('/commerce/jobs','POST',{kind:'ai',bookIds:[book.id],task:'complete'});const completed=await finished(complete.id);assert.equal(completed.state,'completed',JSON.stringify(completed));
+  const conversation=await api(`/commerce/jobs/${complete.id}/conversation?bookId=${book.id}`);
+  assert.equal(conversation.runs.length,1);assert.equal(conversation.runs[0].prompt,completed.request.prompt);
+  assert.match(conversation.runs[0].input,/模拟 · Qoder 图书/);assert.match(conversation.runs[0].system,/成本固定取/);
+  assert.deepEqual(JSON.parse(conversation.runs[0].reply),answer);
+  const wrongBook=await fetch(`${base}/api/commerce/jobs/${complete.id}/conversation?bookId=999999`,{headers:{'x-kf-token':token}});assert.equal(wrongBook.status,400);
+  assert.equal((await fetch(`${base}/api/commerce/jobs/${complete.id}/conversation?bookId=${book.id}`)).status,401);
   const draft=(await api('/agents/ai/books/'+book.id+'/draft')).draft;assert.equal(draft.provider,'qoder');assert.equal(draft.model,'Fixture-Qoder');assert.equal(draft.title,answer.title);assert.equal(draft.sellPrice,17);
   const call=await lastCall();assert.equal(call.cwd,path.join(root,'agent-support/workspace'));assert.ok(call.args.includes('--strict-mcp-config'));assert.equal(call.args[call.args.indexOf('--tools')+1],'');assert.equal(call.args[call.args.indexOf('--permission-mode')+1],'dont_ask');assert.equal(JSON.parse(call.args[call.args.indexOf('--settings')+1]).disableAllHooks,true);assert.match(call.prompt,/模拟 · Qoder 图书/);
   // A long prompt goes through stdin instead of Windows command-line arguments.
@@ -56,13 +64,16 @@ try{
   await fs.writeFile(path.join(root,'hold'),'');
   const held=await api('/commerce/jobs','POST',{kind:'ai',bookIds:[book.id],task:'text',prompt:'pause-and-resume'});
   await until(async()=> (await lastCall())?.prompt.includes('pause-and-resume'),'held Qoder prompt');
+  const live=await api(`/commerce/jobs/${held.id}/conversation?bookId=${book.id}`);assert.equal(live.runs.length,1);assert.equal(live.runs[0].reply,'');assert.match(live.runs[0].input,/pause-and-resume/);
   await api('/commerce/jobs/'+held.id+'/pause','POST',{});
   config.provider='opencode';config.model='fixture/writer';config=await api('/agents/ai/config','POST',config);
   await fs.unlink(path.join(root,'hold'));await api('/commerce/jobs/'+held.id+'/resume','POST',{});
   const resumed=await finished(held.id);assert.equal(resumed.state,'completed',JSON.stringify(resumed));assert.equal(resumed.request.provider,'qoder');assert.equal(resumed.request.model,'Fixture-Qoder');
+  const attempts=await api(`/commerce/jobs/${held.id}/conversation?bookId=${book.id}`);assert.equal(attempts.runs.length,2);assert.ok(attempts.runs.some(run=>run.reply.includes(answer.text)));
   const revision=(await api('/agents/ai/books/'+book.id+'/draft')).draft.revision;
   await fs.writeFile(path.join(root,'error'),'');
   const broken=await api('/commerce/jobs','POST',{kind:'ai',bookIds:[book.id],provider:'qoder',task:'text'});const failed=await finished(broken.id);assert.equal(failed.state,'failed');assert.match(failed.result.items[0].error,/额度/);assert.ok(!JSON.stringify(failed).includes('fixture-secret'));assert.equal((await api('/agents/ai/books/'+book.id+'/draft')).draft.revision,revision);
+  const failedConversation=await api(`/commerce/jobs/${broken.id}/conversation?bookId=${book.id}`);assert.equal(failedConversation.runs[0].reply,'');assert.ok(!JSON.stringify(failedConversation).includes('fixture-secret'));
   await fs.unlink(path.join(root,'error'));await api('/commerce/jobs/'+broken.id+'/retry','POST',{});assert.equal((await finished(broken.id)).state,'completed');
   const command=await api('/agents/ai/command','POST',{bookId:book.id,provider:'qoder',model:'Auto',task:'text',prompt:'copy-this-prompt'});assert.match(command.command,/--provider 'qoder' --model 'Auto'/);
   const connection=await api('/agents/mcp','POST',{enabled:true});

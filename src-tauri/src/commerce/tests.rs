@@ -3,6 +3,118 @@ use crate::models::{BookPatch, CaptureInput};
 use std::{fs, path::PathBuf};
 
 #[tokio::test]
+async fn textbook_classifications_filter_together_and_keep_facets_outside_the_page() {
+    let f=Fixture::new();
+    let (a,b,blank)={
+        let c=lock(&f.state);
+        let create=|title:&str,level:&str,major:&str,category:&str| db::create_book(&c,&serde_json::from_value(json!({"title":title,"textbookLevel":level,"applicableMajor":major,"category":category,"stock":0})).unwrap()).unwrap().id;
+        let a=create("软件技术教材","高职高专","软件技术","高职教育类");
+        let b=create("组合分级教材","本科、高职","计算机","理工类");
+        let blank=create("未分类书目","","","");
+        let patch=serde_json::from_value(json!({"教材分级":"本科","适用专业":"法学","类别":"文科类"})).unwrap();
+        db::update_book(&c,a,&patch).unwrap();db::update_book(&c,a,&patch).unwrap();
+        db::init(&c).unwrap();
+        assert_eq!(db::get_book(&c,a).unwrap().unwrap().textbook_classifications.len(),2);
+        (a,b,blank)
+    };
+    for (filter,expected) in [
+        (json!({"textbookLevel":"高职高专"}),vec![a]),
+        (json!({"applicableMajor":"计算机"}),vec![b]),
+        (json!({"category":"文科类"}),vec![a]),
+        (json!({"textbookLevel":"本科、高职","applicableMajor":"计算机","category":"理工类"}),vec![b]),
+        (json!({"textbookLevel":"高职高专","category":"文科类"}),vec![]),
+        (json!({"category":"__empty__"}),vec![blank]),
+        (json!({"q":"软件","category":"文科类"}),vec![a]),
+    ] {
+        let response=library::list(State(f.state.clone()),axum::extract::Query(serde_json::from_value(filter).unwrap())).await.unwrap().0;
+        let ids:Vec<i64>=response["items"].as_array().unwrap().iter().map(|b|b["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids,expected);
+    }
+    let page=library::list(State(f.state.clone()),axum::extract::Query(serde_json::from_value(json!({"pageSize":1})).unwrap())).await.unwrap().0;
+    assert_eq!(page["total"],3);assert_eq!(page["items"].as_array().unwrap().len(),1);
+    assert!(page["applicableMajors"].as_array().unwrap().contains(&json!("软件技术")));
+}
+
+#[tokio::test]
+async fn batch_sources_starts_and_advances_only_after_collected_results() {
+    let f=Fixture::new(); let a=f.book("第一本"); let b=f.book("第二本");
+    let job=jobs::create(State(f.state.clone()),Json(json!({"kind":"sources","bookIds":[a,b]}))).await.unwrap().0;
+    jobs::advance_sources(&f.state,&job).await.unwrap();
+    let job=jobs::detail(State(f.state.clone()),Path(job["id"].as_i64().unwrap())).await.unwrap().0;
+    assert_eq!(job["state"],"waiting"); assert_eq!(job["result"]["items"][0]["state"],"searching");
+    assert!(job["result"]["items"][0]["searchUrl"].as_str().unwrap().contains("taoshuPriceSearch"));
+    assert_eq!(job["result"]["items"][1]["state"],"pending");
+    let req=job["result"]["items"][0]["requestId"].clone();
+    let _=price_search::control(State(f.state.clone()),Path(a),Json(json!({"action":"batch","requestId":req,"batch":1,"items":[{"url":"https://item.taobao.com/item.htm?id=998","title":"教材","price":8,"shop":"小谷吖书店"}]}))).await.unwrap();
+    let _=price_search::control(State(f.state.clone()),Path(a),Json(json!({"action":"finish","requestId":req,"reason":"visible-end"}))).await.unwrap();
+    jobs::advance_sources(&f.state,&job).await.unwrap();
+    let next=jobs::detail(State(f.state.clone()),Path(job["id"].as_i64().unwrap())).await.unwrap().0;
+    assert_eq!(next["processed"],1); assert_eq!(next["result"]["items"][0]["state"],"done");
+    assert_eq!(next["result"]["items"][1]["state"],"searching");
+    let req=next["result"]["items"][1]["requestId"].clone();
+    let _=price_search::control(State(f.state.clone()),Path(b),Json(json!({"action":"batch","requestId":req,"batch":1,"items":[{"url":"https://item.taobao.com/item.htm?id=999","title":"第二本教材","price":9}]}))).await.unwrap();
+    let _=price_search::control(State(f.state.clone()),Path(b),Json(json!({"action":"finish","requestId":req,"reason":"visible-end"}))).await.unwrap();
+    jobs::advance_sources(&f.state,&next).await.unwrap();
+    let completed=jobs::detail(State(f.state.clone()),Path(job["id"].as_i64().unwrap())).await.unwrap().0;
+    assert_eq!(completed["state"],"completed");assert_eq!(completed["processed"],2);
+    let sources=source_list(&lock(&f.state),Some(a)).unwrap();
+    assert_eq!(sources[0]["data"]["status"],"available");
+    assert_eq!(sources[0]["data"]["freight"],0);
+    assert_eq!(sources[0]["data"]["verificationMethod"],"shop-whitelist");
+}
+
+#[test]
+fn whitelist_defaults_are_exact_configurable_and_need_a_price() {
+    let f=Fixture::new();let bid=f.book("白名单");let c=lock(&f.state);
+    let mut data=json!({"shop":"南工大书店","price":null,"status":"pending"});
+    source_defaults(&c,bid,&mut data).unwrap();assert_eq!(data["status"],"pending");
+    assert_eq!(data["isbn"],"9787300000001");assert_eq!(data["condition"],"九成新");
+    data["price"]=json!(12);source_defaults(&c,bid,&mut data).unwrap();assert_eq!(data["status"],"available");
+    let _=db::save_settings(&c,&json!({"sourceShopWhitelist":[]})).unwrap();
+    let mut data=json!({"shop":"南工大书店","price":12,"status":"pending"});source_defaults(&c,bid,&mut data).unwrap();assert_eq!(data["status"],"pending");
+    assert!(crate::listing::title_length(&crate::listing::limit_title(&"书ABC".repeat(30)))<=60);
+    let defaults=db::settings(&c).xianyu_publish_defaults;
+    assert!(crate::regions::valid(defaults.province,defaults.city,defaults.district));assert_eq!(defaults.stock,9999);
+}
+
+#[tokio::test]
+async fn blank_edition_does_not_add_channel_blockers_or_missing_metadata_tasks() {
+    let f = Fixture::new();
+    let bid = f.book("版次可选的图书");
+    f.channel(bid, "physical");
+    {
+        let c = lock(&f.state);
+        let before = check_channel(&c, 1).unwrap();
+        let patch = serde_json::from_value(json!({"edition":""})).unwrap();
+        db::update_book(&c, bid, &patch).unwrap();
+        let after = check_channel(&c, 1).unwrap();
+        assert_eq!(before["blockers"], after["blockers"]);
+        assert!(!after["blockers"].as_array().unwrap().is_empty());
+        c.execute("INSERT INTO book_profiles(book_id,data) VALUES(?,?)", params![bid,json!({"confirmed":true}).to_string()]).unwrap();
+    }
+    let tasks = overview(State(f.state.clone())).await.unwrap().0;
+    assert!(!tasks["tasks"].as_array().unwrap().iter().any(|t| text(t,"reason").contains("确认书目")));
+}
+
+#[tokio::test]
+async fn primary_source_cost_tracks_saved_selection_updates_and_clearing() {
+    let f=Fixture::new();let bid=f.book("主选成本同步");
+    let mut input=json!({"bookId":bid,"primary":false,"data":{"url":"https://item.taobao.com/item.htm?id=123","status":"available","price":30.8,"freight":2,"sku":"第2版 单册","checkedAt":db::now()}});
+    let saved=save_source(State(f.state.clone()),Json(input.clone())).await.unwrap().0;
+    assert_eq!(db::get_book(&lock(&f.state),bid).unwrap().unwrap().cost_price,None);
+    input["id"]=saved["id"].clone(); input["primary"]=json!(true);
+    let _=save_source(State(f.state.clone()),Json(input.clone())).await.unwrap();
+    assert_eq!(db::get_book(&lock(&f.state),bid).unwrap().unwrap().cost_price,Some(30.8));
+    input["data"]["price"]=json!(28.5);
+    let _=save_source(State(f.state.clone()),Json(input.clone())).await.unwrap();
+    assert_eq!(db::get_book(&lock(&f.state),bid).unwrap().unwrap().cost_price,Some(28.5));
+    input["primary"]=json!(false);
+    let _=save_source(State(f.state.clone()),Json(input)).await.unwrap();
+    let book=db::get_book(&lock(&f.state),bid).unwrap().unwrap();
+    assert_eq!(book.cost_price,None);assert_eq!(book.sell_price,None);
+}
+
+#[tokio::test]
 async fn primary_source_requires_verified_details_before_selection_changes() {
     let f=Fixture::new(); let bid=f.book("确认主选货源");
     let mut input=json!({"bookId":bid,"primary":true,"data":{"url":"https://item.taobao.com/item.htm?id=12","status":"pending","price":12,"freight":null,"dropship":false}});
@@ -125,6 +237,7 @@ async fn lowest_price_scroll_batches_are_durable_deduplicated_and_cancelable() {
     let first = call(json!({"action":"start"})).await.unwrap().0;
     let req = first["requestId"].clone();
     assert_eq!(first["query"],"9787300000001");
+    assert_eq!(reqwest::Url::parse(first["searchUrl"].as_str().unwrap()).unwrap().query_pairs().find(|(k,_)|k=="q").unwrap().1,"9787300000001");
     assert!(first["searchUrl"].as_str().unwrap().contains("sort=price-asc"));
     let item = |id:i64,price:f64| json!({"url":format!("https://item.taobao.com/item.htm?id={id}"),"title":"候选版本","shop":"教材店","price":price});
     let p1 = call(json!({"action":"page","requestId":req,"page":1,"items":[item(1,0.5),item(1,0.5),item(2,10.0)]})).await.unwrap().0;

@@ -1,6 +1,7 @@
 <script setup>
 import {computed,onMounted,onBeforeUnmount,reactive,ref} from 'vue';
 import {api} from '../../api';
+import {weightedLength,limitTitle} from '../../xianyu';
 import AiGenerateDialog from './AiGenerateDialog.vue';
 const props=defineProps({bookId:Number});
 const emit=defineEmits(['updated','settings','progress']);
@@ -37,13 +38,13 @@ const money=n=>n==null?'待核实':'¥'+Number(n).toFixed(2);
       <p v-if="data.draft.stale" class="status-line">资料或货源已变化，请重新生成草稿。</p>
       <p v-for="(warning,index) in data.draft.warnings || []" :key="index" class="status-line">{{ warning }}</p>
       <form @submit.prevent="save">
-        <div class="form-grid"><label class="field"><span>参考成本（不含运费）</span><output class="ai-cost">{{ money(data.costBasis.cost) }}</output></label><label class="field"><span>草稿售价</span><input v-model.number="form.sellPrice" class="input" type="number" min="0.01" step="0.01" /></label><label class="field wide"><span>上架标题</span><input v-model="form.title" class="input" maxlength="30" /></label><label class="field wide"><span>上架文案</span><textarea v-model="form.description" class="input" rows="4" maxlength="4000" /></label></div>
+        <div class="form-grid"><label class="field"><span>参考成本（不含运费）</span><output class="ai-cost">{{ money(data.costBasis.cost) }}</output></label><label class="field"><span>草稿售价</span><input v-model.number="form.sellPrice" class="input" type="number" min="0.01" step="0.01" /></label><label class="field wide"><span>上架标题（{{ weightedLength(form.title) }}/60，中文计 2）</span><input v-model="form.title" class="input" maxlength="60" @input="form.title = limitTitle(form.title)" /></label><label class="field wide"><span>上架文案</span><textarea v-model="form.description" class="input" rows="4" maxlength="4000" /></label></div>
         <details v-if="form.text || data.draft.task==='text'" class="ai-analysis" :open="data.draft.task==='text'"><summary>自定义文本</summary><textarea v-model="form.text" aria-label="自定义文本" class="input" rows="4" maxlength="8000" /><button type="button" class="link-btn" @click="copyText">复制文本</button></details>
         <details v-if="data.draft.analysis" class="ai-analysis"><summary>定价与生成依据</summary><p>{{ data.draft.analysis }}</p><p v-if="data.costBasis" class="muted">{{ data.costBasis.reason }} · 运费 {{ money(data.costBasis.freight) }}</p></details>
         <div class="row"><button class="btn" :disabled="busy || !dirty">保存草稿</button><span v-if="message" class="success-text" role="status">{{ message }}</span></div>
       </form>
     </template>
-    <p v-else-if="!running && !error" class="muted">参考成本 {{ money(data?.costBasis?.cost) }} · 淘宝第二低商品价，不含运费</p>
+    <p v-else-if="!running && !error" class="muted">参考成本 {{ money(data?.costBasis?.cost) }} · {{ data?.costBasis?.reason || '待选择主选货源' }}</p>
     <AiGenerateDialog v-if="open" :ids="[bookId]" @close="open=false" @created="created" @settings="emit('settings')" />
   </section>
 </template>

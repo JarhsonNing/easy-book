@@ -31,6 +31,9 @@ const filter = reactive({
   major: "",
   year: "",
   readiness: "",
+  textbookLevel: "",
+  applicableMajor: "",
+  category: "",
   page: 1,
   pageSize: 30,
 });
@@ -75,7 +78,7 @@ async function refresh() {
   }
 }
 watch(
-  () => [filter.q, filter.school, filter.major, filter.year, filter.readiness],
+  () => [filter.q, filter.school, filter.major, filter.year, filter.readiness, filter.textbookLevel, filter.applicableMajor, filter.category],
   () => {
     filter.page = 1;
     clearTimeout(timer);
@@ -146,8 +149,8 @@ const money = (v) => (v == null ? "—" : `¥${Number(v).toFixed(2)}`);
         ><input
           v-model="filter.major"
           class="input"
-          aria-label="专业"
-          placeholder="专业"
+          aria-label="学校专业"
+          placeholder="学校专业"
         /><SearchSelect v-model="filter.year" class="input" aria-label="年份"
           ><option value="">全部年份</option>
           <option v-for="y in data.years" :key="y.year" :value="y.year">
@@ -162,6 +165,13 @@ const money = (v) => (v == null ? "—" : `¥${Number(v).toFixed(2)}`);
           <option value="sources">缺货源</option>
           <option value="images">缺图片</option></SearchSelect
         >
+        <div class="textbook-filters">
+        <SearchSelect v-for="(label, key) in { textbookLevel: '教材分级', applicableMajor: '适用专业', category: '类别' }" :key="key" v-model="filter[key]" class="input" :aria-label="label">
+          <option value="">全部{{ label }}</option>
+          <option value="__empty__">未填写{{ label }}</option>
+          <option v-for="value in (key === 'textbookLevel' ? data.textbookLevels : key === 'applicableMajor' ? data.applicableMajors : data.categories) || []" :key="value" :value="value">{{ value }}</option>
+        </SearchSelect>
+        </div>
       </div>
       <div v-if="selected.size" class="selection-bar">
         <span>已选 {{ selected.size }} 本</span
@@ -217,7 +227,8 @@ const money = (v) => (v == null ? "—" : `¥${Number(v).toFixed(2)}`);
                     ><small
                       >{{ b.author || "作者待补充" }} ·
                       {{ b.edition || "版次待确认" }}</small
-                    ><small>{{ b.isbn || "ISBN 待补充" }}</small></span
+                    ><small>{{ b.isbn || "ISBN 待补充" }}</small>
+                    <small v-for="(classification, i) in b.textbookClassifications || []" :key="i">{{ [classification.textbookLevel, classification.applicableMajor, classification.category].filter(Boolean).join(' · ') }}</small></span
                   >
                 </button>
               </td>
@@ -300,3 +311,8 @@ const money = (v) => (v == null ? "—" : `¥${Number(v).toFixed(2)}`);
     <AiGenerateDialog v-if="aiIds" :ids="aiIds" @close="aiIds=null" @created="$emit('ai-created',$event)" @settings="$emit('ai-settings')" />
   </section>
 </template>
+
+<style scoped>
+.textbook-filters { display: flex; flex-wrap: wrap; flex-basis: 100%; gap: 10px; }
+.textbook-filters :deep(.search-select) { width: 180px; min-width: 0; }
+</style>

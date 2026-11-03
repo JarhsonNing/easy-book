@@ -3,6 +3,9 @@ import { onMounted, reactive, ref } from "vue";
 import { api } from "../../api";
 import AgentSettings from './AgentSettings.vue';
 import AiSettings from './AiSettings.vue';
+import RegionSelect from '../RegionSelect.vue';
+import { isValidRegion } from '../../regions';
+import { listOf } from '../../xianyu';
 const props = defineProps({ active: { type: Boolean, default: true } });
 const emit = defineEmits(["updated", "open-opencode", "open-qoder"]);
 const tab = ref("platform"),
@@ -25,6 +28,41 @@ const credentials = reactive({ appKey: "", appSecret: "" }),
     directory: "taoshu-images",
   }),
   settings = reactive({});
+const publishDefaults = reactive({ channelCatId: '', channelCatName: '教材教辅', province: 330000, city: 330100, district: 330101, stock: 9999, stuffStatus: 90 });
+const categories = ref([]), categoriesLoading = ref(false), categoriesError = ref('');
+const whitelistText = ref('');
+async function saveWhitelist() {
+  await action(async () => {
+    const saved = await api.saveSettings({ sourceShopWhitelist: whitelistText.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean) });
+    Object.assign(settings, saved);
+  });
+}
+async function loadCategories() {
+  categoriesLoading.value = true;
+  categoriesError.value = '';
+  try {
+    categories.value = listOf(await api.xianyuCall('categories', { item_biz_type: 2, sp_biz_type: 24 }));
+  } catch (e) {
+    categoriesError.value = e.message;
+  } finally {
+    categoriesLoading.value = false;
+  }
+}
+function savePublishDefaults() {
+  return action(async () => {
+    const hasRegion = publishDefaults.province || publishDefaults.city || publishDefaults.district;
+    if (hasRegion && !isValidRegion(publishDefaults)) throw new Error('请选择完整的默认省、市、区');
+    const saved = await api.saveSettings({ xianyuPublishDefaults: {
+      channelCatId: String(publishDefaults.channelCatId),
+      province: Number(publishDefaults.province),
+      city: Number(publishDefaults.city),
+      district: Number(publishDefaults.district),
+      channelCatName: categories.value.find(c => String(c.channel_cat_id) === String(publishDefaults.channelCatId))?.channel_cat_name || publishDefaults.channelCatName,
+      stock: Number(publishDefaults.stock), stuffStatus: Number(publishDefaults.stuffStatus),
+    } });
+    Object.assign(settings, saved);
+  });
+}
 async function action(fn) {
   busy.value = true;
   error.value = "";
@@ -55,6 +93,15 @@ async function load() {
     });
     hostingConfigured.value = h.tokenConfigured;
     Object.assign(settings, s);
+    whitelistText.value = (s.sourceShopWhitelist || []).join('\n');
+    if (s.xianyuPublishDefaults) Object.assign(publishDefaults, {
+      channelCatId: s.xianyuPublishDefaults.channelCatId || '',
+      province: s.xianyuPublishDefaults.province || '',
+      city: s.xianyuPublishDefaults.city || '',
+      district: s.xianyuPublishDefaults.district || '',
+      channelCatName: s.xianyuPublishDefaults.channelCatName || '教材教辅',
+      stock: s.xianyuPublishDefaults.stock || 9999, stuffStatus: s.xianyuPublishDefaults.stuffStatus ?? 90,
+    });
   } catch (e) {
     error.value = e.message;
   }
@@ -93,13 +140,15 @@ onMounted(load);
           platform: '平台连接',
           images: '图片托管',
           pricing: '定价与文案',
+          publishing: '发布默认值',
+          sources: '货源白名单',
           app: '应用',
           agents: 'Agent 接入',
           ai: 'AI 流程',
         }"
         :key="key"
         :class="{ active: tab === key }"
-        @click="tab = key; if(key==='agents')agentsVisited=true; if(key==='ai')aiVisited=true"
+        @click="tab = key; if(key==='agents')agentsVisited=true; if(key==='ai')aiVisited=true; if(key==='publishing')loadCategories()"
       >
         {{ label }}
       </button>
@@ -150,6 +199,42 @@ onMounted(load);
         <summary>店铺授权</summary>
         <p>在闲管家完成店铺授权后，在订单页切换店铺。</p>
       </details>
+    </form>
+    <form
+      v-if="tab === 'publishing'"
+      class="settings-form"
+      @submit.prevent="savePublishDefaults"
+    >
+      <h2>发布默认值</h2>
+      <p class="hint">打开发布窗口时自动带入，可在单次发布中修改。</p>
+      <fieldset class="xy-fieldset publish-defaults" :disabled="busy">
+        <label class="field">
+          <span>图书类目</span>
+          <SearchSelect v-model="publishDefaults.channelCatId" class="input" :disabled="categoriesLoading">
+            <option value="">不设置默认类目</option>
+            <option v-if="publishDefaults.channelCatId && !categories.some(cat => String(cat.channel_cat_id) === publishDefaults.channelCatId)" :value="publishDefaults.channelCatId">已保存类目（{{ publishDefaults.channelCatId }}）</option>
+            <option v-for="cat in categories" :key="cat.channel_cat_id" :value="String(cat.channel_cat_id)">{{ cat.channel_cat_name }}</option>
+          </SearchSelect>
+        </label>
+        <p v-if="categoriesLoading" class="hint" role="status">正在加载类目…</p>
+        <div v-if="categoriesError" class="row">
+          <p class="error-panel" role="alert">{{ categoriesError }}</p>
+          <button class="btn" type="button" @click="loadCategories">重新加载</button>
+        </div>
+        <RegionSelect :model-value="publishDefaults" :required="false" @update:model-value="Object.assign(publishDefaults, $event)" />
+        <label class="field"><span>默认库存</span><input v-model.number="publishDefaults.stock" type="number" min="1" max="9999" class="input" required /></label>
+        <p class="hint">默认成色为九成新；类目提供“轻微使用痕迹”属性时自动选中。</p>
+        <div class="row">
+          <button class="btn primary" :disabled="busy">{{ busy ? '保存中…' : '保存默认值' }}</button>
+          <button class="btn" type="button" @click="Object.assign(publishDefaults, { channelCatId: '', province: '', city: '', district: '' })">清空</button>
+        </div>
+      </fieldset>
+    </form>
+    <form v-if="tab === 'sources'" class="settings-form" @submit.prevent="saveWhitelist">
+      <h2>货源店铺白名单</h2>
+      <p class="hint">每行一个完整店名。匹配店铺且有采购价和 ISBN 时，自动标为可用并启用代发；品相默认九成新、运费默认 0。</p>
+      <label class="field"><span>免核验店铺</span><textarea v-model="whitelistText" class="input whitelist-input" rows="8" /></label>
+      <button class="btn primary" :disabled="busy">保存白名单</button>
     </form>
     <form
       v-if="tab === 'images'"
@@ -251,3 +336,9 @@ onMounted(load);
     </form>
   </section>
 </template>
+
+<style scoped>
+.publish-defaults { display: grid; gap: 16px; }
+.publish-defaults .row { margin-top: 0; }
+.whitelist-input { min-height: 180px; }
+</style>

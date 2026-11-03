@@ -41,6 +41,15 @@ export const itemUrl = (id) => 'https://www.goofish.com/item?id=' + encodeURICom
 export function weightedLength(value) {
   return Array.from(value || '').reduce((n, c) => n + (c.codePointAt(0) > 127 ? 2 : 1), 0);
 }
+export function limitTitle(value) {
+  let length = 0, result = '';
+  for (const c of String(value || '').trim()) {
+    length += c.codePointAt(0) > 127 ? 2 : 1;
+    if (length > 60) break;
+    result += c;
+  }
+  return result;
+}
 
 export const normalizeIsbn = (value) =>
   String(value || '')

@@ -419,7 +419,7 @@ defineExpose({ refresh });
                 author: '作者',
                 publisher: '出版社',
                 isbn: 'ISBN',
-                edition: '版次',
+                edition: '版次（选填）',
                 volume: '册次',
               }"
               :key="k"
@@ -427,6 +427,7 @@ defineExpose({ refresh });
               ><input
                 v-model="form.book[k]"
                 class="input"
+                :placeholder="k === 'edition' ? '例如：第一版、第2版' : undefined"
                 :required="k === 'title'"
             /></label>
           </div>

@@ -14,6 +14,12 @@ pub(super) struct Filter {
     year: Option<i64>,
     #[serde(default)]
     readiness: String,
+    #[serde(default)]
+    textbook_level: String,
+    #[serde(default)]
+    applicable_major: String,
+    #[serde(default)]
+    category: String,
     page: Option<i64>,
     page_size: Option<i64>,
 }
@@ -30,7 +36,14 @@ pub(super) async fn list(
       AND ((?3='' AND ?4='' AND ?5 IS NULL) OR EXISTS(SELECT 1 FROM school_requirements r WHERE r.book_id=b.id AND r.state='confirmed' AND (?3='' OR r.school=?3) AND (?4='' OR r.major LIKE ?6) AND (?5 IS NULL OR r.year=?5)))
       AND (?7<>'sources' OR NOT EXISTS(SELECT 1 FROM book_sources bs WHERE bs.book_id=b.id AND json_extract(bs.data,'$.status')='available' AND json_extract(bs.data,'$.dropship')=1))
       AND (?7<>'images' OR NOT EXISTS(SELECT 1 FROM images i WHERE i.book_id=b.id))
-      AND (?7<>'version' OR b.isbn='' OR b.edition='')";
+      AND (?7<>'version' OR b.isbn='' OR b.edition='')
+      AND ((?8='' AND ?9='' AND ?10='') OR EXISTS(
+        SELECT 1 FROM book_textbook_classifications tc WHERE tc.book_id=b.id
+        AND (?8='' OR tc.textbook_level=?8 OR (?8='__empty__' AND tc.textbook_level=''))
+        AND (?9='' OR tc.applicable_major=?9 OR (?9='__empty__' AND tc.applicable_major=''))
+        AND (?10='' OR tc.category=?10 OR (?10='__empty__' AND tc.category='')))
+        OR (NOT EXISTS(SELECT 1 FROM book_textbook_classifications tc WHERE tc.book_id=b.id)
+        AND ?8 IN ('','__empty__') AND ?9 IN ('','__empty__') AND ?10 IN ('','__empty__')))";
     let args = params![
         f.q.trim(),
         search,
@@ -38,7 +51,10 @@ pub(super) async fn list(
         f.major,
         f.year,
         major,
-        f.readiness
+        f.readiness,
+        f.textbook_level.trim(),
+        f.applicable_major.trim(),
+        f.category.trim()
     ];
     let total: i64 = c.query_row(
         &format!("SELECT COUNT(*) FROM books b{clause}"),
@@ -70,8 +86,11 @@ pub(super) async fn list(
         "SELECT json_object('year',year) FROM school_requirements GROUP BY year ORDER BY year DESC",
         [],
     )?;
+    let textbook_levels = rows(&c,"SELECT json_quote(textbook_level) FROM book_textbook_classifications WHERE textbook_level<>'' GROUP BY textbook_level ORDER BY textbook_level",[])?;
+    let applicable_majors = rows(&c,"SELECT json_quote(applicable_major) FROM book_textbook_classifications WHERE applicable_major<>'' GROUP BY applicable_major ORDER BY applicable_major",[])?;
+    let categories = rows(&c,"SELECT json_quote(category) FROM book_textbook_classifications WHERE category<>'' GROUP BY category ORDER BY category",[])?;
     Ok(Json(
-        json!({"items":items,"total":total,"page":page,"pageSize":size,"schools":schools,"years":years}),
+        json!({"items":items,"total":total,"page":page,"pageSize":size,"schools":schools,"years":years,"textbookLevels":textbook_levels,"applicableMajors":applicable_majors,"categories":categories}),
     ))
 }
 

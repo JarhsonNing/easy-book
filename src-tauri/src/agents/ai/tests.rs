@@ -1,4 +1,13 @@
 use super::*;
+
+#[test]
+fn generated_copy_is_limited_before_it_becomes_a_publish_draft() {
+    let mut c=conn();let id=book(&c);let ctx=context(&c,id).unwrap();let expected=fingerprint(&c,id).unwrap();
+    let tx=c.transaction().unwrap();
+    let draft=apply(&tx,id,1,&json!({"task":"copy"}),&ctx,&expected,&json!({"title":"教材ABC".repeat(30),"description":"图书资料如实描述","analysis":"依据现有资料"})).unwrap();
+    assert!(crate::listing::title_length(draft["title"].as_str().unwrap())<=60);
+    assert!(!draft["title"].as_str().unwrap().is_empty());
+}
 use crate::models::{BookPatch, ListingInput};
 
 fn comparison(ids: &[i64]) -> Value {
@@ -19,7 +28,7 @@ fn source_comparisons_preserve_sale_drafts_prices_and_selection_and_detect_chang
     assert_eq!(source_analysis::read(&c,id).unwrap()["report"]["stale"],false);
     assert_eq!(draft_data(&c,id).unwrap()["revision"],"keep");
     assert_eq!(db::get_book(&c,id).unwrap().unwrap().sell_price,Some(20.0));
-    assert_eq!(db::get_book(&c,id).unwrap().unwrap().cost_price,Some(8.0));
+    assert_eq!(db::get_book(&c,id).unwrap().unwrap().cost_price,Some(11.0));
     assert_eq!(c.query_row("SELECT is_primary FROM book_sources WHERE id=?",[sid],|r|r.get::<_,bool>(0)).unwrap(),false);
     assert_eq!(c.query_row("SELECT is_primary FROM book_sources WHERE id=?",[other],|r|r.get::<_,bool>(0)).unwrap(),true);
     c.execute("UPDATE book_sources SET data=json_set(data,'$.freight',4) WHERE id=?",[sid]).unwrap();
@@ -63,7 +72,9 @@ fn source(c: &Connection, id: i64, price: f64, freight: Option<f64>, primary: bo
         params![id, primary, d.to_string(), db::now()],
     )
     .unwrap();
-    c.last_insert_rowid()
+    let sid = c.last_insert_rowid();
+    refresh_reference_cost(c,id).unwrap();
+    sid
 }
 fn input() -> ListingInput {
     ListingInput {
@@ -115,51 +126,38 @@ fn queued_jobs_are_deduplicated_within_each_executor() {
     drop(s);assert!(path.starts_with(std::env::temp_dir()));fs::remove_dir_all(path).unwrap();
 }
 #[test]
-fn cost_uses_second_lowest_product_price_separate_from_freight_and_primary_selection() {
-    let c = conn();
-    let id = book(&c);
-    source(&c, id, 1.0, None, false);
-    let verified = source(&c, id, 10.0, Some(2.0), false);
-    let ctx = context(&c, id).unwrap();
-    let basis = cost_basis(&ctx, None);
-    assert_eq!(basis["sourceId"], verified);
-    assert_eq!(basis["cost"], 10.0);
-    assert_eq!(basis["freight"], 2.0);
-    assert_eq!(basis["landedCost"], 12.0);
-    c.execute(
-        "UPDATE book_sources SET is_primary=1 WHERE id=(SELECT min(id) FROM book_sources)",
-        [],
-    )
-    .unwrap();
-    let basis = cost_basis(&context(&c, id).unwrap(), None);
-    assert_eq!(basis["cost"], 10.0);
+fn cost_uses_user_selected_source_without_freight_or_ai_override() {
+    let c = conn(); let id = book(&c);
+    source(&c,id,1.0,None,false);
+    source(&c,id,10.0,Some(2.0),false);
+    let selected = source(&c,id,35.0,Some(3.0),true);
+    let basis = cost_basis(&context(&c,id).unwrap(),Some(999));
+    assert_eq!(basis["cost"],35.0); assert_eq!(basis["sourceId"],selected);
+    assert_eq!(basis["freight"],3.0); assert_eq!(basis["landedCost"],38.0);
+    assert_eq!(db::get_book(&c,id).unwrap().unwrap().cost_price,Some(35.0));
+    assert_eq!(db::get_book(&c,id).unwrap().unwrap().sell_price,Some(20.0));
 }
 #[test]
-fn reference_cost_requires_two_distinct_valid_taobao_prices() {
-    let c = conn();
-    let id = book(&c);
-    source(&c, id, 2.0, Some(0.0), false);
-    source(&c, id, 2.0, None, false);
-    assert!(cost_basis(&context(&c, id).unwrap(), None)["cost"].is_null());
-    let next = source(&c, id, 3.0, None, false);
-    c.execute("UPDATE book_sources SET data=json_set(data,'$.status','pending','$.dropship',0) WHERE id=?",[next]).unwrap();
-    let basis = cost_basis(&context(&c, id).unwrap(), None);
-    assert_eq!(basis["cost"], 3.0);
-    assert!(basis["freight"].is_null());
-    assert_eq!(basis["verified"], false);
-    c.execute(
-        "UPDATE book_sources SET data=json_set(data,'$.url','https://example.org/book') WHERE id=?",
-        [next],
-    )
-    .unwrap();
-    assert!(cost_basis(&context(&c, id).unwrap(), None)["cost"].is_null());
+fn reference_cost_requires_a_valid_selected_source_but_not_freight_or_two_quotes() {
+    let c = conn(); let id = book(&c);
+    let sid = source(&c,id,3.0,None,false);
+    assert!(cost_basis(&context(&c,id).unwrap(),None)["cost"].is_null());
+    c.execute("UPDATE book_sources SET is_primary=1 WHERE id=?",[sid]).unwrap();
+    let basis = cost_basis(&context(&c,id).unwrap(),None);
+    assert_eq!(basis["cost"],3.0); assert!(basis["freight"].is_null());
+    for data in [json!({"status":"pending","price":3}),json!({"status":"unavailable","price":3}),json!({"status":"available","price":null}),json!({"status":"available","price":-1})] {
+        c.execute("UPDATE book_sources SET data=json_patch(data,?) WHERE id=?",params![data.to_string(),sid]).unwrap();
+        refresh_reference_cost(&c,id).unwrap();
+        assert!(cost_basis(&context(&c,id).unwrap(),None)["cost"].is_null());
+        assert_eq!(db::get_book(&c,id).unwrap().unwrap().cost_price,None);
+    }
 }
 #[test]
 fn ai_saves_draft_and_enforces_profit_floor_without_selecting_source() {
     let mut c = conn();
     let id = book(&c);
     source(&c, id, 1.0, None, false);
-    source(&c, id, 10.0, Some(2.0), false);
+    source(&c, id, 10.0, Some(2.0), true);
     let ctx = context(&c, id).unwrap();
     let expected = fingerprint(&c, id).unwrap();
     let tx = c.transaction().unwrap();
@@ -178,7 +176,7 @@ fn ai_saves_draft_and_enforces_profit_floor_without_selecting_source() {
             |r| r.get::<_, i64>(0)
         )
         .unwrap(),
-        0
+        1
     );
     let copy = listing_defaults(&c, id, input()).unwrap();
     assert_eq!(copy.title.as_deref(), Some("测试上架标题"));
@@ -200,7 +198,7 @@ fn ai_saves_draft_and_enforces_profit_floor_without_selecting_source() {
 fn unknown_cost_preserves_prices_and_invalid_copy_rolls_back_price_changes() {
     let mut c = conn();
     let id = book(&c);
-    source(&c, id, 10.0, None, true);
+    source(&c, id, 10.0, None, false);
     let ctx = context(&c, id).unwrap();
     let expected = fingerprint(&c, id).unwrap();
     let tx = c.transaction().unwrap();
@@ -222,7 +220,7 @@ fn unknown_cost_preserves_prices_and_invalid_copy_rolls_back_price_changes() {
         Some(20.0)
     );
     c.execute(
-        "UPDATE book_sources SET data=json_set(data,'$.freight',0)",
+        "UPDATE book_sources SET is_primary=1,data=json_set(data,'$.freight',0)",
         [],
     )
     .unwrap();
@@ -231,7 +229,7 @@ fn unknown_cost_preserves_prices_and_invalid_copy_rolls_back_price_changes() {
     let expected = fingerprint(&c, id).unwrap();
     {
         let tx = c.transaction().unwrap();
-        assert!(apply(&tx,id,2,&json!({"task":"complete"}),&ctx,&expected,&json!({"title":"x".repeat(31),"description":"test","analysis":"valid analysis","sellPrice":99})).is_err());
+        assert!(apply(&tx,id,2,&json!({"task":"complete"}),&ctx,&expected,&json!({"title":"test","description":"x".repeat(4001),"analysis":"valid analysis","sellPrice":99})).is_err());
     }
     assert_eq!(
         db::get_book(&c, id).unwrap().unwrap().sell_price,
@@ -306,42 +304,40 @@ fn parses_cli_text_events_and_reports_quota_without_returning_provider_secrets()
     assert!(request(&conn(), &json!({"task":"shell"})).is_err());
 }
 #[test]
-fn latest_search_prices_win_over_old_source_prices_and_missing_rank_clears_stale_cost() {
-    let c = conn();
-    let id = book(&c);
-    source(&c, id, 50.0, Some(0.0), false);
-    let data = json!({"items":[{"url":"https://item.taobao.com/item.htm?id=1001","price":8},{"url":"https://item.taobao.com/item.htm?id=1002","price":3},{"url":"https://item.taobao.com/item.htm?id=1003","price":8},{"url":"https://item.taobao.com/item.htm?id=1004","price":12},{"url":"https://example.org/not-taobao","price":0.1},{"url":"https://item.taobao.com/item.htm?id=1005","price":0}]});
-    c.execute(
-        "INSERT INTO price_searches(book_id,data) VALUES(?,?)",
-        params![id, data.to_string()],
-    )
-    .unwrap();
-    let basis = cost_basis(&context(&c, id).unwrap(), Some(999));
-    assert_eq!(basis["cost"], 8.0);
-    assert_eq!(basis["distinctPrices"], 3);
-    assert!(basis["freight"].is_null());
-    c.execute("UPDATE books SET cost_price=99 WHERE id=?", [id])
-        .unwrap();
-    refresh_reference_cost(&c, id).unwrap();
-    assert_eq!(db::get_book(&c, id).unwrap().unwrap().cost_price, Some(8.0));
-    db::update_book(
-        &c,
-        id,
-        &serde_json::from_value::<BookPatch>(json!({"costPrice":999})).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(db::get_book(&c, id).unwrap().unwrap().cost_price, Some(8.0));
-    c.execute(
-        "UPDATE price_searches SET data=? WHERE book_id=?",
-        params![
-            json!({"items":[{"url":"https://item.taobao.com/item.htm?id=1001","price":8}]})
-                .to_string(),
-            id
-        ],
-    )
-    .unwrap();
-    refresh_reference_cost(&c, id).unwrap();
-    assert_eq!(db::get_book(&c, id).unwrap().unwrap().cost_price, None);
+fn searches_cannot_override_selected_cost_and_edits_and_deselection_refresh_it() {
+    let c = conn(); let id = book(&c);
+    let sid = source(&c,id,50.0,Some(0.0),true);
+    let other = source(&c,id,20.0,None,false);
+    c.execute("INSERT INTO price_searches(book_id,data) VALUES(?,?)",params![id,json!({"items":[{"url":"https://item.taobao.com/item.htm?id=1001","price":8},{"url":"https://item.taobao.com/item.htm?id=1002","price":3}]}).to_string()]).unwrap();
+    db::update_book(&c,id,&serde_json::from_value::<BookPatch>(json!({"costPrice":999})).unwrap()).unwrap();
+    assert_eq!(db::get_book(&c,id).unwrap().unwrap().cost_price,Some(50.0));
+    c.execute("UPDATE books SET status='listed' WHERE id=?",[id]).unwrap();
+    c.execute("UPDATE book_sources SET data=json_set(data,'$.price',51) WHERE id=?",[sid]).unwrap();
+    refresh_reference_cost(&c,id).unwrap();
+    assert_eq!(db::get_book(&c,id).unwrap().unwrap().cost_price,Some(51.0));
+    c.execute("UPDATE book_sources SET is_primary=0 WHERE book_id=?",[id]).unwrap();
+    c.execute("UPDATE book_sources SET is_primary=1 WHERE id=?",[other]).unwrap();
+    refresh_reference_cost(&c,id).unwrap();
+    assert_eq!(db::get_book(&c,id).unwrap().unwrap().cost_price,Some(20.0));
+    c.execute("UPDATE book_sources SET is_primary=0 WHERE book_id=?",[id]).unwrap();
+    refresh_reference_cost(&c,id).unwrap();
+    assert_eq!(db::get_book(&c,id).unwrap().unwrap().cost_price,None);
+    assert_eq!(db::get_book(&c,id).unwrap().unwrap().sell_price,Some(20.0));
+}
+#[test]
+fn migration_replaces_old_ranked_costs_and_retains_other_profile_fields() {
+    let c = conn(); let id = book(&c); source(&c,id,35.0,Some(2.0),true);
+    let unselected = book(&c);
+    c.execute("UPDATE books SET cost_price=99",[]).unwrap();
+    c.execute("INSERT INTO book_profiles(book_id,data) VALUES(?,?) ON CONFLICT(book_id) DO UPDATE SET data=excluded.data",params![id,json!({"volume":"上册","taobaoCostBasis":{"cost":99}}).to_string()]).unwrap();
+    migrate_cost_rule(&c).unwrap();
+    assert_eq!(db::get_book(&c,id).unwrap().unwrap().cost_price,Some(35.0));
+    assert_eq!(db::get_book(&c,unselected).unwrap().unwrap().cost_price,None);
+    let raw:String=c.query_row("SELECT data FROM book_profiles WHERE book_id=?",[id],|r|r.get(0)).unwrap();
+    let profile:Value=serde_json::from_str(&raw).unwrap();
+    assert_eq!(profile["volume"],"上册");assert!(profile.get("taobaoCostBasis").is_none());assert_eq!(profile["sourceCostBasis"]["cost"],35.0);
+    migrate_cost_rule(&c).unwrap();
+    assert_eq!(db::get_book(&c,id).unwrap().unwrap().sell_price,Some(20.0));
 }
 #[test]
 fn automatic_hooks_are_opt_in_coalesced_and_ignore_price_only_edits() {

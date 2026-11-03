@@ -9,11 +9,14 @@ description: 通过淘书工坊 MCP 查询 ISBN、单本或批量入库图书，
 
 ## 导入约定
 
+- 教材分类字段：Excel 的“教材分级”对应 `textbookLevel`，“适用专业”对应 `applicableMajor`，“类别”对应 `category`。三个字段均选填，原表的组合值原样保留，不拆分、不推断。单本和批量导入均支持。同版同册书目命中既有图书时追加该组分类，不覆盖已有分类；每条来源使用自己的稳定 `externalId`。
+- 为已经导入的图书补分类，使用 `taoshu_append_book_classifications({books:[...]})`，每批 1–200 条。每条提供原 `source`、`externalId`（或明确的 `bookId`）、`sourceUrl` 和需要追加的分类字段；建议同时提供已核对的 `isbn`、`edition`、`volume` 作身份校验。可沿用原外部编号，无须重传原导入内容或编造修订编号。只追加分类，不新建图书，不修改原导入回执、价格、库存、货源、图片；重复返回 `unchanged`。检查逐条 `appended`、`unchanged`、`failed`，不要用 `taoshu_import_books` 沿用旧 externalId 补字段。
+
 - 使用真实公开来源。为书目和学校用书保留 `sourceUrl`，不要把模型生成的出版社、ISBN、版次或运费当成检索事实。
 - `source` 表示本次数据来源系统，`externalId` 是该系统中稳定的记录编号。重试沿用这两个值及原参数；工具拒绝用同一编号覆盖不同内容，返回已保存结果时直接复用。
 - 先用 `taoshu_search_books` 查询已有版本。ISBN 相同仍须核对版次与册次；冲突时将候选交给用户选择，不能仅按书名合并。
 - 缺 ISBN 时优先调用 `taoshu_lookup_isbn({query:书名})`。它查询豆瓣建议列表，并尝试提取一个书名完全匹配候选的详情；其他候选用返回的数字 `subjectId` 再查。对照作者、出版社、版次和册次选定版本，不能把第一条或同名候选的 ISBN 直接应用到图书。`blocked`、`failed`、`detailError` 和 `isbn_missing` 均不能视为已取得 ISBN；遇到安全验证停止请求，尊重 `retryAfterSeconds`，不换通道绕过限制。查询自带缓存，不必反复请求，也不会自动改书库。
-- 单本用 `taoshu_import_book`；多本用 `taoshu_import_books({books:[...]})`，每批 1–200 条，每条字段与单本相同，分别提供真实 `source`、稳定 `externalId`、`sourceUrl`、书名和有依据的版次，ISBN 等未知文本字段省略或留空。资料不足的条目保留失败原因，不编造版次来通过校验。查看 `items` 中逐条的 `created`、`matched`、`reused`、`failed` 和 `bookId`，不能只看请求成功就宣布全部入库。失败条目可修正后重试；已成功条目沿用原参数可安全复用。
+- 单本用 `taoshu_import_book`；多本用 `taoshu_import_books({books:[...]})`，每批 1–200 条，每条字段与单本相同，分别提供真实 `source`、稳定 `externalId`、`sourceUrl` 和书名。版次选填，未知时省略或留空；用户可填写“第一版”等版次文本，留空不默认视为第一版。ISBN 等未知文本字段也可省略或留空，不编造版次。查看 `items` 中逐条的 `created`、`matched`、`reused`、`failed` 和 `bookId`，不能只看请求成功就宣布全部入库。失败条目可修正后重试；已成功条目沿用原参数可安全复用。
 - 导入返回的 `bookId` 用于后续学校用书、货源和图片关联。
 - 货源由 `taoshu_import_source` 保存为本书候选，不覆盖已核验报价。未知采购价、运费填 `null`，不要按零处理。
 - 图片使用 `taoshu_import_image` 发送真实图片的 Base64 和公开来源地址。服务不读取 Agent 的本地文件路径，不代抓远程图片。图片应对应当前版本；传入 `mimeType` 为 PNG、JPEG 或 WebP。

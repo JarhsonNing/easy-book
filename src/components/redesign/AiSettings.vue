@@ -18,7 +18,7 @@ onMounted(load);
     <label class="field"><span>AI 执行器</span><select class="input" :value="form.provider" :disabled="busy" @change="chooseProvider"><option value="opencode">OpenCode</option><option value="qoder">Qoder CLI</option></select></label>
     <QoderAccount v-if="form.provider==='qoder'" @signed-in="modelSelect?.refresh()" />
     <AiModelSelect ref="modelSelect" v-model="form.model" :provider="form.provider" :disabled="busy" />
-    <p class="muted ai-model-line">成本取淘宝商品价的第二低价，去重、不含运费。</p>
+    <p class="muted ai-model-line">成本使用你保存的主选货源采购单价，不含运费。</p>
     <label class="check-line"><input v-model="form.enabled" type="checkbox" />自动完善草稿</label>
     <div v-if="form.enabled" class="ai-auto-options"><label class="check-line"><input v-model="form.autoOnImport" type="checkbox" />图书入库或资料变更后</label><label class="check-line"><input v-model="form.autoOnSources" type="checkbox" />货源更新后</label><p class="muted">使用所选模型额度；结果写入草稿，发布前确认。</p></div>
     <label class="field"><span>提示词模板</span><SearchSelect v-model="task" class="input" aria-label="提示词模板"><option value="sources">整理货源</option><option value="complete">定价并生成文案</option><option value="pricing">分析定价</option><option value="copy">生成上架文案</option><option value="text">自定义文本</option></SearchSelect></label>

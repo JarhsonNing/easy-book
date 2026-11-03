@@ -32,6 +32,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/commerce/catalog/sync", post(library::sync_catalog))
         .route("/api/commerce/jobs", get(jobs::list).post(jobs::create))
         .route("/api/commerce/jobs/{id}", get(jobs::detail))
+        .route("/api/commerce/jobs/{id}/conversation", get(jobs::conversation))
         .route("/api/commerce/jobs/{id}/{action}", post(jobs::control))
         .route("/api/commerce/books", get(books))
         .route("/api/commerce/books/{id}", get(book_detail))
@@ -266,9 +267,36 @@ async fn save_profile(
 async fn sources(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!(source_list(&lock(&s), None)?)))
 }
+pub(super) fn source_defaults(c: &Connection, bid: i64, data: &mut Value) -> rusqlite::Result<()> {
+    if data["status"] == "available" && !text(data,"checkedAt").is_empty() { return Ok(()); }
+    let Some(book) = db::get_book(c, bid)? else { return Ok(()); };
+    if text(data,"isbn").is_empty() { data["isbn"] = json!(book.isbn); }
+    if text(data,"sku").is_empty() { data["sku"] = json!(book.isbn); }
+    if text(data,"condition").is_empty() { data["condition"] = json!("九成新"); }
+    if data["freight"].is_null() { data["freight"] = json!(0); }
+    let shop: String = text(data,"shop").chars().filter(|c| !c.is_whitespace()).collect();
+    let trusted = !shop.is_empty() && db::settings(c).source_shop_whitelist.iter().any(|s|
+        s.chars().filter(|c| !c.is_whitespace()).collect::<String>() == shop);
+    if trusted && text(data,"status") != "unavailable" && data["price"].as_f64().is_some_and(|p| p > 0.0) && !text(data,"sku").is_empty() {
+        data["status"] = json!("available"); data["dropship"] = json!(true);
+        data["checkedAt"] = json!(db::now()); data["verificationMethod"] = json!("shop-whitelist");
+    }
+    Ok(())
+}
+
+pub(super) fn prepare_sources(c: &Connection, bid: i64) -> rusqlite::Result<()> {
+    for source in source_list(c, Some(bid)).map_err(|_| rusqlite::Error::InvalidQuery)? {
+        if source["data"]["status"] != "pending" { continue; }
+        let mut data = source["data"].clone();
+        source_defaults(c,bid,&mut data)?;
+        c.execute("UPDATE book_sources SET data=?,updated_at=? WHERE id=?",params![data.to_string(),db::now(),source["id"].as_i64()])?;
+    }
+    Ok(())
+}
+
 async fn save_source(
     State(s): State<AppState>,
-    Json(v): Json<Value>,
+    Json(mut v): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let mut c = lock(&s);
     let tx = c.transaction()?;
@@ -276,6 +304,7 @@ async fn save_source(
     if let Some(b) = bid {
         book_exists(&tx, b)?;
     }
+    if let Some(bid) = bid { source_defaults(&tx,bid,&mut v["data"])?; }
     let d = &v["data"];
     web_url(&required(d, "url")?)?;
     amount(d, "price", true)?;
@@ -352,6 +381,7 @@ pub fn attach_capture_candidate(conn: &Connection, capture: &crate::models::Capt
         let data = json!({"url":capture.url,"title":capture.title,"shop":capture.shop,"price":capture.price,"freight":null,"sku":"","condition":"","status":"pending","dropship":false,"checkedAt":"","origin":"capture","originCaptureId":capture.id});
         conn.execute("INSERT INTO book_sources(book_id,data,updated_at) VALUES(?,?,?)",params![book_id,data.to_string(),db::now()])?;
     }
+    prepare_sources(conn,book_id)?;
     crate::agents::ai::auto_queue(conn,book_id,"source")?;
     Ok(())
 }
@@ -430,9 +460,6 @@ pub fn check_channel(conn: &Connection, id: i64) -> Result<Value, ApiError> {
     let mut errors = Vec::<String>::new();
     if b.isbn.trim().is_empty() {
         errors.push("缺少 ISBN".into())
-    }
-    if b.edition.trim().is_empty() {
-        errors.push("版次尚未确认".into())
     }
     if text(&d, "title").is_empty() {
         errors.push("缺少商品标题".into())
@@ -562,8 +589,8 @@ async fn overview(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         let b = db::get_book(&c, id)?.unwrap();
         let v = summary(&c, &b)?;
         let mut reasons = Vec::new();
-        if v["profile"]["confirmed"] != true || b.isbn.is_empty() || b.edition.is_empty() {
-            reasons.push("确认书目 / 补 ISBN 与版次")
+        if v["profile"]["confirmed"] != true || b.isbn.is_empty() {
+            reasons.push("确认书目 / 补 ISBN")
         }
         if v["physicalReady"] != true {
             reasons.push("准备实体货源")

@@ -1,6 +1,7 @@
 use super::*;
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use rusqlite::params;
 struct Fixture {
     s: AppState,
     path: PathBuf,
@@ -25,6 +26,105 @@ impl Drop for Fixture {
 }
 fn metadata() -> Value {
     json!({"source":"test-agent","externalId":"book-1","sourceUrl":"https://example.org/official/books","title":"数据库系统概论","author":"王珊","publisher":"高等教育出版社","isbn":"9787040406641","edition":"第5版","volume":"上册","publicationYear":"2014"})
+}
+
+#[test]
+fn classification_patch_via_mcp_uses_original_external_ids_and_preserves_business_data() {
+    let f=Fixture::new();let original=metadata();
+    let id=imports::execute(&f.s,"taoshu_import_book",&original).unwrap()["bookId"].as_i64().unwrap();
+    let before={
+        let c=lock(&f.s);
+        c.execute("UPDATE books SET cost_price=11.5,sell_price=29,stock=17 WHERE id=?",[id]).unwrap();
+        db::add_image(&c,id,"upload","","original.png",Some(100),Some(200)).unwrap();
+        c.execute("INSERT INTO book_sources(book_id,is_primary,data,updated_at) VALUES(?,0,?,'now')",params![id,json!({"url":"https://item.taobao.com/item.htm?id=123","price":9,"status":"available"}).to_string()]).unwrap();
+        (json!(db::book_detail(&c,id).unwrap().unwrap()), c.query_row("SELECT payload_hash FROM agent_imports WHERE tool='taoshu_import_book'",[],|r|r.get::<_,String>(0)).unwrap())
+    };
+    let patch=json!({"source":"test-agent","externalId":"book-1","sourceUrl":"https://example.org/official/books","isbn":"9787040406641","edition":"第5版","volume":"上册","textbookLevel":"高职高专","applicableMajor":"软件技术","category":"理工类"});
+    let mut reimport=original.clone();reimport["category"]=json!("理工类");
+    assert!(imports::execute(&f.s,"taoshu_import_book",&reimport).unwrap_err().contains("不同内容"));
+    let rpc=|books:Value|mcp::dispatch(&f.s,json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"taoshu_append_book_classifications","arguments":{"books":books}}}));
+    let first=rpc(json!([patch.clone()]));
+    assert_eq!(first["result"]["isError"],false);let result=&first["result"]["structuredContent"];
+    assert_eq!(result["appended"],1);assert_eq!(result["items"][0]["bookId"],id);
+    let replay=rpc(json!([patch.clone()]));assert_eq!(replay["result"]["structuredContent"]["unchanged"],1);
+    let mut second=patch;second["category"]=json!("高职教育类");
+    assert_eq!(rpc(json!([second]))["result"]["structuredContent"]["appended"],1);
+    let c=lock(&f.s);let mut after=json!(db::book_detail(&c,id).unwrap().unwrap());
+    assert_eq!(after["textbookClassifications"].as_array().unwrap().len(),2);
+    after["textbookClassifications"]=before.0["textbookClassifications"].clone();assert_eq!(after,before.0);
+    assert_eq!(c.query_row("SELECT payload_hash FROM agent_imports WHERE tool='taoshu_import_book'",[],|r|r.get::<_,String>(0)).unwrap(),before.1);
+    assert_eq!(c.query_row("SELECT count(*) FROM books",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(crate::commerce::source_list(&c,Some(id)).unwrap()[0]["data"]["price"],9);
+    drop(c);
+    assert_eq!(imports::execute(&f.s,"taoshu_import_book",&original).unwrap()["reused"],true);
+}
+
+#[test]
+fn classification_patch_reports_each_error_and_never_creates_or_overwrites_books() {
+    let f=Fixture::new();let id=imports::execute(&f.s,"taoshu_import_book",&metadata()).unwrap()["bookId"].as_i64().unwrap();
+    let valid=json!({"bookId":id,"sourceUrl":"https://example.org/catalog","category":"文科类"});
+    let mut unsupported=valid.clone();unsupported["stock"]=json!(999);
+    let mut conflict=valid.clone();conflict["isbn"]=json!("9787505720176");
+    let mut version=valid.clone();version["edition"]=json!("第一版");
+    let mut missing=valid.clone();missing["bookId"]=json!(999999);
+    let mut empty=valid.clone();empty["category"]=json!("");
+    let unknown=json!({"source":"test-agent","externalId":"missing","sourceUrl":"https://example.org/catalog","category":"理工类"});
+    let result=imports::execute(&f.s,"taoshu_append_book_classifications",&json!({"books":[valid,unsupported,conflict,version,missing,empty,unknown]})).unwrap();
+    assert_eq!(result["appended"],1);assert_eq!(result["failed"],6);
+    assert_eq!(db::get_book(&lock(&f.s),id).unwrap().unwrap().textbook_classifications.len(),1);
+    crate::book_deletion::delete(&f.s,&[id]).unwrap();
+    let deleted=imports::execute(&f.s,"taoshu_append_book_classifications",&json!({"books":[{"source":"test-agent","externalId":"book-1","sourceUrl":"https://example.org/catalog","category":"理工类"}]})).unwrap();
+    assert_eq!(deleted["failed"],1);assert!(db::get_book(&lock(&f.s),id).unwrap().is_none());
+}
+
+#[test]
+fn textbook_import_keeps_each_classification_for_the_same_isbn() {
+    let f=Fixture::new();let mut first=metadata();
+    first["textbookLevel"]=json!("高职高专");first["applicableMajor"]=json!("软件技术");first["category"]=json!("高职教育类");
+    let imported=imports::batch(&f.s,&json!({"books":[first.clone()]})).unwrap();
+    assert_eq!(imported["failed"],0);let id=imported["items"][0]["bookId"].as_i64().unwrap();
+    first["externalId"]=json!("another-catalog-row");first["category"]=json!("理工类");
+    let matched=imports::batch(&f.s,&json!({"books":[first.clone()]})).unwrap();
+    assert_eq!(matched["matched"],1);assert_eq!(matched["items"][0]["bookId"],id);
+    imports::batch(&f.s,&json!({"books":[first]})).unwrap();
+    let book=db::get_book(&lock(&f.s),id).unwrap().unwrap();
+    assert_eq!(book.textbook_classifications.len(),2);
+    assert!(book.textbook_classifications.iter().any(|c|c.category=="理工类"));
+    assert!(book.textbook_classifications.iter().any(|c|c.category=="高职教育类"));
+    for tool in mcp::tools().into_iter().filter(|t| t["name"]=="taoshu_import_book") {
+        for key in ["textbookLevel","applicableMajor","category"] { assert_eq!(tool["inputSchema"]["properties"][key]["type"],"string"); }
+    }
+}
+#[test]
+fn edition_is_optional_and_first_edition_is_preserved() {
+    let f = Fixture::new();
+    let mut omitted = metadata();
+    omitted.as_object_mut().unwrap().remove("edition");
+    let unknown = imports::execute(&f.s, "taoshu_import_book", &omitted).unwrap()["bookId"].as_i64().unwrap();
+    assert_eq!(db::get_book(&lock(&f.s), unknown).unwrap().unwrap().edition, "");
+    let mut blank = omitted.clone();
+    blank["externalId"] = json!("blank-edition");
+    blank["edition"] = json!("");
+    assert_eq!(imports::execute(&f.s, "taoshu_import_book", &blank).unwrap()["bookId"], unknown);
+    let mut first = omitted;
+    first["externalId"] = json!("first-edition");
+    first["edition"] = json!("第一版");
+    let known = imports::execute(&f.s, "taoshu_import_book", &first).unwrap()["bookId"].as_i64().unwrap();
+    assert_ne!(known, unknown);
+    let c = lock(&f.s);
+    assert_eq!(db::get_book(&c, known).unwrap().unwrap().edition, "第一版");
+    for edition in ["", "第一版"] {
+        let patch = serde_json::from_value(json!({"edition":edition})).unwrap();
+        assert_eq!(db::update_book(&c, known, &patch).unwrap().unwrap().edition, edition);
+    }
+    for tool in mcp::tools() {
+        let schema = if tool["name"] == "taoshu_import_books" {
+            &tool["inputSchema"]["properties"]["books"]["items"]
+        } else if tool["name"] == "taoshu_import_book" || tool["name"] == "taoshu_import_school_book" {
+            &tool["inputSchema"]
+        } else { continue };
+        assert!(!schema["required"].as_array().unwrap().contains(&json!("edition")));
+    }
 }
 #[test]
 fn replay_after_book_deletion_reports_deleted_instead_of_stale_success() {
@@ -391,7 +491,7 @@ fn rpc_catalog_has_no_transaction_or_secret_tools_and_checks_arguments() {
     let f = Fixture::new();
     let catalog = mcp::dispatch(&f.s, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
     let t = catalog["result"]["tools"].as_array().unwrap();
-    assert_eq!(t.len(), 9);
+    assert_eq!(t.len(), 10);
     for tool in t {
         let name = tool["name"].as_str().unwrap();
         assert!(!name.contains("ship") && !name.contains("order") && !name.contains("secret"));

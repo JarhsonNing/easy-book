@@ -92,6 +92,7 @@ pub fn init(c: &rusqlite::Connection) -> anyhow::Result<()> {
             }
         }
     }
+    ai::migrate_cost_rule(c)?;
     Ok(())
 }
 async fn batch_books(

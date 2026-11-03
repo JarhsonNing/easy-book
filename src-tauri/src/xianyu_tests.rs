@@ -36,6 +36,12 @@ async fn remote(
             json!({"list":[{"user_name":"seller","is_valid":true,"authorize_expires":4_000_000_000_i64}]})
         }
         "/api/open/product/create" => {
+            if mock.mode == "create-rejected" {
+                return (
+                    StatusCode::OK,
+                    Json(json!({"code":400,"msg":"类目属性不完整"})),
+                );
+            }
             if mock.mode == "ambiguous" {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -65,7 +71,22 @@ async fn remote(
             }
             json!({"product_id":9007199254740993_u64,"product_status":21})
         }
-        "/api/open/product/publish" => json!({}),
+        "/api/open/product/publish" => {
+            let count = mock
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _)| p.ends_with("/publish"))
+                .count();
+            if mock.mode == "publish-retry" && count == 1 {
+                return (
+                    StatusCode::OK,
+                    Json(json!({"code":400,"msg":"上架失败，请重试"})),
+                );
+            }
+            json!({})
+        }
         "/api/open/order/list" if mock.mode == "commerce-pages" => {
             let page = body["page_no"].as_i64().unwrap();
             let count = if page == 1 { 100 } else { 1 };
@@ -106,6 +127,14 @@ async fn remote(
             json!({"list":[{"product_id":9007199254740993u64,"sku_items":[{"sku_id":9007199254741001u64,"stock":1,"sku_text":"实体版","price":2000},{"sku_id":9007199254741002u64,"stock":2,"sku_text":"电子版","price":500}]}]})
         }
         "/api/open/product/detail" => {
+            if mock.mode == "publish-retry" {
+                return (
+                    StatusCode::OK,
+                    Json(
+                        json!({"code":0,"data":{"product_id":9007199254740993_u64,"product_status":21,"publish_status":9,"publish_shop":[{"user_name":"seller","status":0}]}}),
+                    ),
+                );
+            }
             if mock.mode == "stock-error" {
                 return (
                     StatusCode::OK,
@@ -196,6 +225,155 @@ async fn fixture(mode: &'static str) -> Fixture {
 }
 fn input() -> PublishInput {
     serde_json::from_value(json!({"userName":"seller","channelCatId":"book-cat","province":110000,"city":110100,"district":110101,"title":"测试图书","description":"一本测试用的图书","price":12.34,"expressFee":1.01,"stock":1,"stuffStatus":90,"createOnly":true,"firstImageOnly":true})).unwrap()
+}
+
+#[tokio::test]
+async fn saving_another_crop_updates_image_and_cover_urls_and_dimensions() {
+    let f = fixture("ok").await;
+    let conn = lock(&f.state);
+    let first = db::images_for_book(&conn, 1).unwrap().remove(0);
+    assert_eq!(db::get_book(&conn, 1).unwrap().unwrap().cover_url, first.processed_url);
+    let saved = db::set_processed(&conn, first.id, "new-crop.png", Some(320), Some(480)).unwrap().unwrap();
+    assert_ne!(first.processed_url, saved.processed_url);
+    assert!(saved.processed_url.contains("&v="));
+    assert_eq!(saved.width, Some(320));
+    assert_eq!(saved.height, Some(480));
+    let book = db::get_book(&conn, 1).unwrap().unwrap();
+    assert_eq!(book.cover_url, saved.processed_url);
+    assert_eq!(db::images_for_book(&conn, 1).unwrap()[0].processed_url, saved.processed_url);
+}
+
+#[tokio::test]
+async fn failed_publish_reuses_product_and_task_even_after_channel_migration() {
+    let f = fixture("publish-retry").await;
+    let mut request = input();
+    request.create_only = false;
+    let first = publish_book(State(f.state.clone()), Path(1), Json(request))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(first["status"], "failed");
+    assert_eq!(first["productId"], "9007199254740993");
+    db::init(&lock(&f.state)).unwrap();
+    let mut retry = input();
+    retry.create_only = false;
+    retry.channel_cat_id.clear();
+    retry.title.clear();
+    retry.province = 0;
+    retry.image_mode = "gitee".into();
+    let result = publish_book(State(f.state.clone()), Path(1), Json(retry))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(result["id"], first["id"]);
+    assert_eq!(result["status"], "publishing");
+    assert_eq!(result["attempts"].as_array().unwrap().len(), 3);
+    let requests = f.mock.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(p, _)| p.ends_with("/create"))
+            .count(),
+        1
+    );
+    let publishes: Vec<_> = requests
+        .iter()
+        .filter(|(p, _)| p.ends_with("/publish"))
+        .collect();
+    assert_eq!(publishes.len(), 2);
+    assert_eq!(publishes[0].1, publishes[1].1);
+    assert!(requests.iter().any(|(p, _)| p.ends_with("/detail")));
+    drop(requests);
+    assert!(resume_publish(State(f.state.clone()), Path(1))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn retry_checks_remote_success_without_resubmitting() {
+    let f = fixture("ok").await;
+    let _ = publish_book(State(f.state.clone()), Path(1), Json(input()))
+        .await
+        .unwrap();
+    task_state(&f.state, 1, "failed", "旧的失败记录").unwrap();
+    let result = resume_publish(State(f.state.clone()), Path(1))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(result["status"], "published");
+    assert!(!f
+        .mock
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(p, _)| p.ends_with("/publish")));
+}
+
+#[tokio::test]
+async fn rejected_creation_can_be_submitted_again_without_a_product() {
+    let f = fixture("create-rejected").await;
+    for id in 1..=2 {
+        let result = publish_book(State(f.state.clone()), Path(1), Json(input()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(result["id"], id);
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["productId"], "");
+    }
+}
+
+#[tokio::test]
+async fn book_task_lookup_scopes_to_book_and_current_app_without_recent_limit() {
+    let f = fixture("ok").await;
+    {
+        let conn = lock(&f.state);
+        for key in ["12345", "another-app"] {
+            conn.execute("INSERT INTO xianyu_tasks(book_id,app_key,user_name,title,image_mode,created_at,updated_at) VALUES(1,?,'seller','book','url','now','now')", [key]).unwrap();
+        }
+        for _ in 0..105 {
+            conn.execute("INSERT INTO xianyu_tasks(app_key,user_name,title,image_mode,created_at,updated_at) VALUES('12345','seller','other','url','now','now')", []).unwrap();
+        }
+    }
+    let result = book_tasks_get(State(f.state.clone()), Path(1))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(result.as_array().unwrap().len(), 1);
+    assert_eq!(result[0]["id"], 1);
+}
+
+#[tokio::test]
+async fn publish_defaults_persist_and_can_be_cleared_without_changing_other_settings() {
+    let f = fixture("ok").await;
+    let conn = lock(&f.state);
+    let defaults =
+        json!({"channelCatId":"book-cat","channelCatName":"教材教辅","province":110000,"city":110100,"district":110101,"stock":9999,"stuffStatus":90});
+    let saved = db::save_settings(
+        &conn,
+        &json!({"xianyuPublishDefaults":defaults,"profitRate":18}),
+    )
+    .unwrap();
+    assert_eq!(json!(saved)["xianyuPublishDefaults"], defaults);
+    let reopened = rusqlite::Connection::open(f.dir.join("shelf.db")).unwrap();
+    assert_eq!(
+        json!(db::settings(&reopened))["xianyuPublishDefaults"],
+        defaults
+    );
+    assert!(db::save_settings(
+        &conn,
+        &json!({"xianyuPublishDefaults":{"province":110000,"city":110100,"district":440305}})
+    )
+    .is_err());
+    assert_eq!(
+        json!(db::settings(&conn))["xianyuPublishDefaults"],
+        defaults
+    );
+    let cleared = db::save_settings(&conn, &json!({"xianyuPublishDefaults":{}})).unwrap();
+    assert_eq!(cleared.xianyu_publish_defaults.province, 330000);
+    assert_eq!(cleared.xianyu_publish_defaults.channel_cat_id, "");
+    assert_eq!(cleared.profit_rate, 18.0);
 }
 
 #[test]

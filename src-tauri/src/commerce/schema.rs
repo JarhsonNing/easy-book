@@ -31,6 +31,11 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_jobs_state ON collection_jobs(state,id);
         CREATE TABLE IF NOT EXISTS school_programs(id TEXT PRIMARY KEY, data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS book_profiles(book_id INTEGER PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE, data TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS book_textbook_classifications(
+            book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            textbook_level TEXT NOT NULL DEFAULT '', applicable_major TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(book_id,textbook_level,applicable_major,category));
+        CREATE INDEX IF NOT EXISTS idx_textbook_classification_filter ON book_textbook_classifications(textbook_level,applicable_major,category,book_id);
         CREATE TABLE IF NOT EXISTS book_ai_drafts(book_id INTEGER PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE, data TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS book_source_analyses(book_id INTEGER PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE, data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS price_searches(book_id INTEGER PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE, data TEXT NOT NULL);

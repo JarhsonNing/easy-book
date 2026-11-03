@@ -39,25 +39,28 @@ async function api(route,method='GET',body){const r=await fetch('http://127.0.0.
 async function until(fn,label,seconds=50){for(let n=0;n<seconds*5;n++){const result=await fn();if(result)return result;await wait(200);}throw Error('Timed out: '+label);}
 async function finished(id){return until(async()=>{const j=await api('/commerce/jobs/'+id);return ['completed','failed','partial','canceled'].includes(j.state)?j:null;},'AI job '+id);}
 let sourceNo=10000;
-async function source(bookId,price=10,freight=2){return api('/commerce/sources','POST',{bookId,primary:false,data:{url:'https://item.taobao.com/item.htm?id='+(++sourceNo),title:'模拟已核验货源',sku:'第5版',condition:'九成新',price,freight,status:'available',dropship:true,checkedAt:'2026-10-29'}});}
+async function source(bookId,price=10,freight=2,primary=false){return api('/commerce/sources','POST',{bookId,primary,data:{url:'https://item.taobao.com/item.htm?id='+(++sourceNo),title:'模拟已核验货源',sku:'第5版',condition:'九成新',price,freight,status:'available',dropship:true,checkedAt:'2026-10-29'}});}
 try{
   await until(async()=>{assert.equal(server.exitCode,null,'test API exited before startup');try{const r=await fetch('http://127.0.0.1:'+port+'/api/token');if(r.ok){token=(await r.json()).token;return true;}}catch{}},'API startup',15);
   await api('/agents/opencode','POST',{mode:'local',path:path.resolve(executable)});
   const config=await api('/agents/ai/config');config.model='fixture/book-writer';await api('/agents/ai/config','POST',config);
   const book=await api('/books','POST',{title:'模拟 · 数据库系统概论',author:'模拟作者',isbn:'9787040406641',edition:'第5版',costPrice:8,sellPrice:20,stock:0});
-  const sid=(await source(book.id)).id;
+  const sid=(await source(book.id,10,2,true)).id;
   await source(book.id,1,null);
+  await source(book.id,5,0);
   const job=await api('/commerce/jobs','POST',{kind:'ai',bookIds:[book.id],task:'complete'});
   const result=await finished(job.id);
   if(result.state!=='completed')console.log('FAILED_FIXTURE: '+root+'; '+JSON.stringify(result));
   assert.equal(result.state,'completed',JSON.stringify(result));
+  const conversation=await api(`/commerce/jobs/${job.id}/conversation?bookId=${book.id}`);
+  assert.equal(conversation.runs.length,1);assert.deepEqual(JSON.parse(conversation.runs[0].reply),answer);assert.match(conversation.runs[0].input,/模拟 · 数据库系统概论/);
   const draft=await api('/agents/ai/books/'+book.id+'/draft');assert.equal(draft.draft.title,answer.title);assert.equal(draft.draft.costPrice,10);assert.equal(draft.draft.sellPrice,17);assert.equal(draft.draft.stale,false);
   const saved=await api('/books/'+book.id);assert.equal(saved.costPrice,10);assert.equal(saved.sellPrice,17);assert.equal(saved.stock,0);
   assert.ok(lastBody.messages.some(m=>JSON.stringify(m).includes('模拟 · 数据库系统概论')),'book context was not attached');
   const exposed=(lastBody.tools||[]).map(t=>t.function?.name||t.name||t.type);
   assert.ok(exposed.every(name=>name==='skill'),'text agent must not receive shell/file/MCP/browser/subagent tools');
-  assert.ok(lastBody.messages.some(m=>m.role==='system' && String(m.content).includes('成本固定取淘宝有效商品价')),'restricted draft agent was not selected');
-  assert.equal((await api('/commerce/books/'+book.id)).sources.find(s=>s.id===sid).primary,false);
+  assert.ok(lastBody.messages.some(m=>m.role==='system' && String(m.content).includes('成本固定取用户已选主选货源')),'restricted draft agent was not selected');
+  assert.equal((await api('/commerce/books/'+book.id)).sources.find(s=>s.id===sid).primary,true);
   const preview=await api('/xianyu/books/'+book.id+'/preview');assert.equal(preview.title,answer.title);assert.equal(preview.description,answer.description);assert.equal(preview.price,17);
   // MCP-scoped command line creates a task, waits, and prints generated text.
   await api('/agents/mcp','POST',{enabled:true});
@@ -75,11 +78,11 @@ try{
   const conflict=await finished(editing.id);assert.equal(conflict.state,'failed');assert.match(conflict.result.items[0].error,/修改/);assert.equal((await api('/books/'+book.id)).sellPrice,31);
   // Automatic source changes are debounced; neither them nor draft writes select a source.
   config.enabled=true;config.autoOnImport=false;config.autoOnSources=true;await api('/agents/ai/config','POST',config);
-  await api('/commerce/sources','POST',{id:sid,bookId:book.id,primary:false,data:{url:'https://item.taobao.com/item.htm?id=10001',title:'模拟已核验货源',sku:'第5版',condition:'九成新',price:11,freight:3,status:'available',dropship:true,checkedAt:'2026-10-29'}});
+  await api('/commerce/sources','POST',{id:sid,bookId:book.id,primary:true,data:{url:'https://item.taobao.com/item.htm?id=10001',title:'模拟已核验货源',sku:'第5版',condition:'九成新',price:11,freight:3,status:'available',dropship:true,checkedAt:'2026-10-29'}});
   const auto=await until(async()=>{const j=(await api('/commerce/jobs')).find(j=>j.kind==='ai'&&j.request.auto&&j.request.bookIds.includes(book.id));return j;},'automatic source task');assert.equal((await finished(auto.id)).state,'completed');assert.equal((await api('/books/'+book.id)).costPrice,11);
   const unknown=await api('/books','POST',{title:'模拟 · 运费待核实图书',edition:'第5版',costPrice:6,sellPrice:18,stock:0});await source(unknown.id,1,null);
   const partial=await api('/commerce/jobs','POST',{kind:'ai',bookIds:[unknown.id,book.id],task:'complete'});assert.equal((await finished(partial.id)).state,'completed');assert.equal((await api('/books/'+unknown.id)).costPrice,null);assert.equal((await api('/books/'+unknown.id)).sellPrice,18);
-  const db=new DatabaseSync(path.join(root,'shelf.db'));assert.equal(db.prepare('SELECT count(*) n FROM xianyu_tasks').get().n,0);assert.equal(db.prepare('SELECT count(*) n FROM channel_products').get().n,0);assert.equal(db.prepare('SELECT count(*) n FROM book_sources WHERE is_primary=1').get().n,0);db.close();
+  const db=new DatabaseSync(path.join(root,'shelf.db'));assert.equal(db.prepare('SELECT count(*) n FROM xianyu_tasks').get().n,0);assert.equal(db.prepare('SELECT count(*) n FROM channel_products').get().n,0);assert.equal(db.prepare('SELECT count(*) n FROM book_sources WHERE is_primary=1').get().n,1);db.close();
   console.log('PASS: real OpenCode CLI + simulated local model, evidence context, tool denial, pricing floor, automatic drafts, preview reuse, scoped MCP CLI text, pause/resume, concurrent-edit preservation, automatic source trigger and unknown freight. No remote publication/model billing.');
   if(process.argv.includes('--serve')){console.log('TEST_API: http://127.0.0.1:18997; TEST_DATA: '+root);await new Promise(resolve=>{process.once('SIGINT',resolve);process.once('SIGTERM',resolve);process.stdin.once('data',resolve);process.stdin.resume();});process.stdin.pause();}
 }finally{

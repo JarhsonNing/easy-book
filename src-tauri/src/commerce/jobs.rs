@@ -26,6 +26,16 @@ pub(super) async fn detail(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(get(&lock(&s), id)?))
 }
+pub(super) async fn conversation(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String,String>>,
+) -> Result<Json<Value>, ApiError> {
+    let bid = query.get("bookId").and_then(|v|v.parse::<i64>().ok()).ok_or_else(||ApiError::bad("请选择图书"))?;
+    let job = get(&lock(&s),id)?;
+    tokio::task::spawn_blocking(move || crate::agents::ai::conversation::read(&s,&job,bid))
+        .await.map_err(|e|ApiError::bad(e.to_string()))?.map(Json).map_err(ApiError::bad)
+}
 pub(super) async fn create(
     State(s): State<AppState>,
     Json(v): Json<Value>,
@@ -132,12 +142,54 @@ pub(super) async fn control(
             "cancel" if ["queued", "running", "waiting", "paused"].contains(&state) => "canceled",
             _ => return Err(ApiError::bad("当前状态不支持此操作")),
         };
+        if action == "retry" && job["kind"] == "sources" {
+            let mut result = job["result"].clone();
+            if let Some(items) = result["items"].as_array_mut() {
+                for item in items.iter_mut().filter(|i| i["state"] == "failed") { item["state"] = json!("pending"); }
+            }
+            c.execute("UPDATE collection_jobs SET result=? WHERE id=?",params![result.to_string(),id])?;
+        }
         c.execute(
             "UPDATE collection_jobs SET state=?,error='',updated_at=? WHERE id=?",
             params![next, db::now(), id],
         )?;
     }
     Ok(Json(get(&c, id)?))
+}
+
+pub(super) async fn advance_sources(s: &AppState, job: &Value) -> Result<(), ApiError> {
+    let id = job["id"].as_i64().unwrap();
+    let mut result = job["result"].clone();
+    let items = result["items"].as_array_mut().ok_or_else(||ApiError::bad("任务没有图书明细"))?;
+    for item in items.iter_mut().filter(|i| i["state"] != "done" && i["state"] != "failed") {
+        let bid = item["bookId"].as_i64().unwrap();
+        let mut search = price_search::status(State(s.clone()), Path(bid)).await?.0;
+        if search["state"] == "waiting" && (job["state"] == "queued" || text(&search,"error").contains("重启")) {
+            search = price_search::control(State(s.clone()),Path(bid),Json(json!({"action":"resume","requestId":search["requestId"]}))).await?.0;
+        }
+        let search = if item["state"] == "pending" {
+            if ["searching","waiting"].contains(&text(&search,"state")) { search }
+            else { price_search::control(State(s.clone()),Path(bid),Json(json!({"action":"start"}))).await?.0 }
+        } else { search };
+        if search["requestId"] != item["requestId"] && item["state"] != "pending" {
+            item["state"] = json!("failed"); item["error"] = json!("检索已被另一个任务替换，请重试"); continue;
+        }
+        item["requestId"] = search["requestId"].clone();
+        item["searchUrl"] = search["searchUrl"].clone();
+        item["error"] = search["error"].clone();
+        if search["state"] == "completed" {
+            item["state"] = json!("done"); item["count"] = search["count"].clone();
+        } else if search["state"] == "canceled" {
+            item["state"] = json!("failed"); item["error"] = json!("检索已取消");
+        } else { item["state"] = json!("searching"); break; }
+    }
+    let done = items.iter().filter(|i| i["state"] == "done").count();
+    let failed = items.iter().filter(|i| i["state"] == "failed").count();
+    let complete = done + failed == items.len();
+    let state = if !complete { "waiting" } else if failed == 0 { "completed" } else if done == 0 { "failed" } else { "partial" };
+    lock(s).execute("UPDATE collection_jobs SET result=?,processed=?,state=?,stage=?,updated_at=? WHERE id=? AND state IN ('queued','waiting')",
+        params![result.to_string(),(done+failed) as i64,state,if complete{"货源采集结束"}else{"等待淘宝采集，完成后自动检索下一本"},db::now(),id])?;
+    Ok(())
 }
 
 pub fn start(s: AppState) {
@@ -147,7 +199,7 @@ pub fn start(s: AppState) {
                 let c = lock(&s);
                 rows(
                     &c,
-                    &format!("{SELECT} WHERE state='queued' AND (kind<>'ai' OR coalesce(json_extract(request,'$.notBefore'),0)<=unixepoch()) ORDER BY id LIMIT 1"),
+                    &format!("{SELECT} WHERE (state='queued' AND (kind<>'ai' OR coalesce(json_extract(request,'$.notBefore'),0)<=unixepoch())) OR (kind='sources' AND state='waiting') ORDER BY CASE WHEN kind='sources' AND state='queued' THEN 2 WHEN state='queued' THEN 0 ELSE 1 END,id LIMIT 1"),
                     [],
                 )
                 .ok()
@@ -166,6 +218,10 @@ pub fn start(s: AppState) {
                                 let _=lock(&s).execute("UPDATE collection_jobs SET state=?,stage=?,result=?,updated_at=? WHERE id=? AND state='running'",params![state,if failed==0{"草稿已保存"}else{"生成结束，部分结果待处理"},result.to_string(),db::now(),id]);
                             },Ok(Ok(None))=>{},Ok(Err(e))=>fail(&s,id,e),Err(e)=>fail(&s,id,e.to_string()),
                         }
+                    }
+                }else if text(&job,"kind") == "sources" {
+                    if let Err(e) = advance_sources(&s,&job).await {
+                        let _ = lock(&s).execute("UPDATE collection_jobs SET state='failed',error=?,updated_at=? WHERE id=? AND state IN ('queued','waiting')",params![e.message,db::now(),id]);
                     }
                 }else if text(&job, "kind") != "catalog" {
                     let _=lock(&s).execute("UPDATE collection_jobs SET state='waiting',stage='等待处理',updated_at=? WHERE id=? AND state='queued'",params![db::now(),id]);
@@ -196,9 +252,8 @@ pub fn start(s: AppState) {
                         }
                     }
                 }
-            } else {
-                tokio::time::sleep(Duration::from_millis(600)).await;
             }
+            tokio::time::sleep(Duration::from_millis(600)).await;
         }
     });
 }

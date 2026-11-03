@@ -2,7 +2,10 @@
 import { computed } from 'vue';
 import { provinces, citiesFor, districtsFor, selectProvince, selectCity } from '../regions';
 
-const props = defineProps({ modelValue: { type: Object, required: true } });
+const props = defineProps({
+  modelValue: { type: Object, required: true },
+  required: { type: Boolean, default: true },
+});
 const emit = defineEmits(['update:modelValue']);
 const cities = computed(() => citiesFor(props.modelValue.province));
 const districts = computed(() => districtsFor(props.modelValue.province, props.modelValue.city));
@@ -15,7 +18,7 @@ const districts = computed(() => districtsFor(props.modelValue.province, props.m
       <SearchSelect
         :value="modelValue.province"
         class="input"
-        required
+        :required="required"
         @change="emit('update:modelValue', selectProvince($event.target.value))"
       >
         <option value="">请选择省份</option>
@@ -29,7 +32,7 @@ const districts = computed(() => districtsFor(props.modelValue.province, props.m
       <SearchSelect
         :value="modelValue.city"
         class="input"
-        required
+        :required="required"
         :disabled="!cities.length"
         @change="emit('update:modelValue', selectCity(modelValue.province, $event.target.value))"
       >
@@ -42,7 +45,7 @@ const districts = computed(() => districtsFor(props.modelValue.province, props.m
       <SearchSelect
         :value="modelValue.district"
         class="input"
-        required
+        :required="required"
         :disabled="!districts.length"
         @change="
           emit('update:modelValue', {

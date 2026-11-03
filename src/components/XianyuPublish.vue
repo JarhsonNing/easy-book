@@ -7,6 +7,8 @@ import {
   normalizeIsbn,
   validIsbn,
   weightedLength,
+  taskStates,
+  limitTitle,
 } from "../xianyu";
 import RegionSelect from "./RegionSelect.vue";
 import { isValidRegion, regionVersion, selectProvince } from "../regions";
@@ -17,6 +19,12 @@ const books = ref([]),
   categories = ref([]),
   addresses = ref([]),
   images = ref([]);
+const bookTasks = ref([]);
+const existingTask = computed(() => bookTasks.value.find((t) =>
+  t.userName === form.userName && (t.productId || ['preparing', 'unknown'].includes(t.status)),
+));
+const canContinue = computed(() => existingTask.value?.productId &&
+  ['created', 'offline', 'failed'].includes(existingTask.value.status));
 const bookQuery = ref("");
 async function searchBooks() {
   try {
@@ -45,15 +53,15 @@ const form = reactive({
   saleMode: "physical",
   userName: "",
   channelCatId: "",
-  province: "",
-  city: "",
-  district: "",
+  province: 330000,
+  city: 330100,
+  district: 330101,
   title: "",
   isbn: "",
   description: "",
   price: "",
   expressFee: 0,
-  stock: 1,
+  stock: 9999,
   stuffStatus: 90,
   imageMode: "data-url",
   imageUrls: "",
@@ -80,36 +88,27 @@ const validProperties = computed(
 async function loadBook() {
   const version = ++bookVersion;
   images.value = [];
+  bookTasks.value = [];
   form.isbn = "";
   if (!selectedId.value) return;
   loading.value = true;
   error.value = "";
   try {
-    const [book, copy] = await Promise.all([
+    const [book, copy, tasks] = await Promise.all([
       api.book(selectedId.value),
       api.xianyuPreview(selectedId.value),
+      api.xianyuBookTasks(selectedId.value),
     ]);
     if (version !== bookVersion) return;
     images.value = book.images || [];
+    bookTasks.value = tasks;
     const override =
       Number(selectedId.value) === props.bookId ? props.initialCopy : null;
     Object.assign(form, {
-      title: override?.title ?? copy.title,
+      title: limitTitle(override?.title ?? copy.title),
       isbn: book.isbn || "",
       description: override?.description ?? copy.description,
       price: override?.price ?? copy.price,
-      stock: copy.stock || 1,
-      stuffStatus:
-        {
-          全新: 100,
-          十成新: 99,
-          九五新: 95,
-          九成新: 90,
-          八成新: 80,
-          七成新: 70,
-          六成新: 60,
-          五成新: 50,
-        }[copy.condition] ?? 90,
     });
   } catch (e) {
     if (version === bookVersion) error.value = e.message;
@@ -179,8 +178,13 @@ watch(
         sp_biz_type: 24,
         channel_cat_id: category,
       });
-      if (version === categoryVersion)
+      if (version === categoryVersion) {
         nodes.value = listOf(data).map((n) => ({ ...n, parent: null }));
+        for (const node of [...nodes.value]) {
+          const condition = node.items?.find(i => i.value_name === '轻微使用痕迹');
+          if (condition) { choices[node.property_id] = condition.value_id; await chooseProperty(node); }
+        }
+      }
     } catch (e) {
       if (version === categoryVersion) {
         propertiesError.value = true;
@@ -210,6 +214,20 @@ function chooseRegion(value) {
   Object.assign(form, value);
 }
 async function submit() {
+  if (busy.value || loading.value) return;
+  if (existingTask.value) {
+    busy.value = true;
+    error.value = '';
+    try {
+      const task = await api.xianyuTask(existingTask.value.id, canContinue.value ? 'publish' : 'refresh');
+      emit('created', task);
+    } catch (e) {
+      error.value = e.message;
+    } finally {
+      busy.value = false;
+    }
+    return;
+  }
   if (form.saleMode === "mixed") {
     error.value = "双规格托管自动交付尚未验证，请在图书经营中保存混合商品草稿";
     return;
@@ -279,11 +297,12 @@ async function submit() {
 }
 onMounted(async () => {
   try {
-    const [localBooks, shopData, catData, hosting] = await Promise.all([
+    const [localBooks, shopData, catData, hosting, settings] = await Promise.all([
       api.commerce("/library?pageSize=100").then((r) => r.items),
       api.xianyuCall("shops"),
       api.xianyuCall("categories", { item_biz_type: 2, sp_biz_type: 24 }),
       api.giteeConfig(),
+      api.settings(),
     ]);
     if (hosting.tokenConfigured) form.imageMode = "gitee";
     books.value = localBooks;
@@ -291,6 +310,18 @@ onMounted(async () => {
       books.value.unshift(await api.book(props.bookId));
     shops.value = listOf(shopData);
     categories.value = listOf(catData);
+    const defaults = settings.xianyuPublishDefaults;
+    if (defaults) {
+      if (categories.value.some((cat) => String(cat.channel_cat_id) === defaults.channelCatId))
+        form.channelCatId = defaults.channelCatId;
+      else form.channelCatId = String(categories.value.find(cat => cat.channel_cat_name === (defaults.channelCatName || '教材教辅'))?.channel_cat_id || '');
+      form.stock = defaults.stock || 9999;
+      form.stuffStatus = defaults.stuffStatus ?? 90;
+      if (isValidRegion(defaults)) Object.assign(form, {
+        province: defaults.province, city: defaults.city, district: defaults.district,
+      });
+    }
+    if (!form.channelCatId) form.channelCatId = String(categories.value.find(cat => cat.channel_cat_name === '教材教辅')?.channel_cat_id || '');
     form.userName = availableShops.value[0]?.user_name || "";
     if (selectedId.value) await loadBook();
     try {
@@ -338,11 +369,11 @@ onMounted(async () => {
       </header>
       <form @submit.prevent="submit">
         <div class="xy-dialog-body">
-          <p class="xy-notice">
+          <p v-if="!existingTask" class="xy-notice">
             Gitee 模式会上传本地图片，验证匿名直链后再创建商品。也可选择 Base64
             实验模式；明确拒绝 Data URL 时会尝试纯 Base64。
           </p>
-          <label class="field"
+          <label v-if="!existingTask" class="field"
             ><span>售卖形态</span
             ><SearchSelect v-model="form.saleMode" class="input">
               <option value="physical">实体单规格（兼容现有流程）</option>
@@ -391,6 +422,12 @@ onMounted(async () => {
                 </option>
               </SearchSelect></label
             >
+            <div v-if="existingTask" class="span-2" role="status">
+              <p>发布记录 #{{ existingTask.id }} · {{ taskStates[existingTask.status] || existingTask.status }}</p>
+              <p v-if="existingTask.error" class="xy-error">{{ existingTask.error }}</p>
+              <p class="hint">{{ canContinue ? '将复用已有商品，核查状态后继续上架。' : '先核查远端发布结果，再按记录状态继续操作。' }}</p>
+            </div>
+            <template v-else>
             <label class="field"
               ><span>图书类目</span
               ><SearchSelect
@@ -585,6 +622,7 @@ onMounted(async () => {
                 type="checkbox"
               />只创建，稍后在发布记录中上架</label
             >
+            </template>
           </fieldset>
         </div>
         <footer class="xy-dialog-foot">
@@ -609,15 +647,17 @@ onMounted(async () => {
             :disabled="
               busy ||
               loading ||
-              propertiesLoading ||
+              (!existingTask && (propertiesLoading ||
               !validProperties ||
-              form.saleMode === 'mixed'
+              form.saleMode === 'mixed'))
             "
           >
             {{
               busy
                 ? "提交中，请稍候…"
-                : form.createOnly
+                : existingTask
+                  ? canContinue ? "继续上架" : "核查发布结果"
+                  : form.createOnly
                   ? "创建并测试图片"
                   : "创建并上架"
             }}

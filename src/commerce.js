@@ -24,7 +24,7 @@ export const emptySource = () => ({
   sku: '',
   condition: '九成新',
   price: null,
-  freight: null,
+  freight: 0,
   dropship: false,
   status: 'pending',
   checkedAt: '',

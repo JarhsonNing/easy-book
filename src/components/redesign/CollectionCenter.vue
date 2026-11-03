@@ -9,6 +9,7 @@ import {
   watch,
 } from "vue";
 import { api } from "../../api";
+import TaskConversation from "./TaskConversation.vue";
 const props = defineProps({ active: Boolean });
 const emit = defineEmits(["open-book", "work-item", "open-schools", "open-draft"]);
 const jobs = ref([]),
@@ -159,7 +160,7 @@ const time = (v) =>
           {{ label }}
         </button>
       </nav>
-      <button class="btn primary" @click="newTask">新建采集</button>
+      <button class="btn primary" @click="newTask">新建任务</button>
     </div>
     <p v-if="refreshError" class="error-panel" role="alert">{{ refreshError }}</p>
     <p v-if="error" class="error-panel" role="alert">{{ error }}</p>
@@ -210,18 +211,18 @@ const time = (v) =>
             </td>
             <td class="muted">{{ time(j.updatedAt) }}</td>
             <td>
-              <button class="btn small" @click="selectJob(j)">查看</button>
+              <button class="btn small" @click="selectJob(j)">查看详情</button>
             </td>
           </tr>
           <tr v-if="!visible.length">
-            <td colspan="7" class="table-empty">暂无采集任务</td>
+            <td colspan="7" class="table-empty">暂无任务</td>
           </tr>
         </tbody>
       </table>
     </div>
     <section v-if="selected" ref="detailElement" class="task-detail">
       <header class="module-bar">
-        <h2>{{ selected.title }}</h2>
+        <h2>任务详情 · {{ selected.title }}</h2>
         <button class="btn small" @click="selected = null">收起</button>
       </header>
       <div class="row">
@@ -304,6 +305,7 @@ const time = (v) =>
           </tr>
         </tbody>
       </table>
+      <TaskConversation v-if="selected.kind==='ai'" :key="selected.id" :job="selected" :active="active" />
       <template
         v-if="
           selected.kind === 'catalog' &&
@@ -336,7 +338,7 @@ const time = (v) =>
         aria-labelledby="collect-title"
       >
         <header class="module-bar">
-          <h2 id="collect-title">采集学校用书</h2>
+          <h2 id="collect-title">新建任务 · 学校用书采集</h2>
           <button class="btn small" @click="creating = false">关闭</button>
         </header>
         <form @submit.prevent="create">

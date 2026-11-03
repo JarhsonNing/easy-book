@@ -182,7 +182,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/xianyu/books/{id}/orders", get(orders::book_orders))
         .route("/api/xianyu/books/{id}/preview", get(preview_book))
-        .route("/api/xianyu/books/{id}/publish", post(publish_book))
+        .route(
+            "/api/xianyu/books/{id}/publish",
+            get(book_tasks_get).post(publish_book),
+        )
         .route("/api/xianyu/tasks/{id}/refresh", post(refresh_task))
         .route("/api/xianyu/tasks/{id}/publish", post(resume_publish))
         .route("/api/xianyu/tasks/{id}/verify-images", post(verify_images))
@@ -553,6 +556,20 @@ async fn tasks_get(State(state): State<AppState>) -> Result<Json<Value>, ApiErro
     Ok(Json(json!(list)))
 }
 
+async fn book_tasks_get(
+    State(state): State<AppState>,
+    Path(book_id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let key = config(&state)?.app_key;
+    let conn = lock(&state);
+    let mut stmt =
+        conn.prepare("SELECT * FROM xianyu_tasks WHERE app_key=? AND book_id=? ORDER BY id DESC")?;
+    let list = stmt
+        .query_map(params![key, book_id], task_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Json(json!(list)))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PublishInput {
@@ -662,6 +679,20 @@ async fn publish_book(
     if !input.sale_mode.is_empty() && input.sale_mode != "physical" {
         return Err(ApiError::bad("售卖形态无效"));
     }
+    let existing = {
+        let conn = lock(&state);
+        conn.query_row("SELECT * FROM xianyu_tasks WHERE book_id=? AND app_key=? AND user_name=? AND (product_id<>'' OR status IN ('preparing','unknown')) ORDER BY id DESC LIMIT 1",
+            params![book_id, cfg.app_key, input.user_name], task_row).optional()?
+    };
+    if let Some(t) = existing {
+        if t.status == "failed" && !t.product_id.is_empty() && !input.create_only {
+            continue_publish(&state, &cfg, t.id).await?;
+            return Ok(Json(json!(task(&state, t.id, &cfg.app_key)?)));
+        }
+        return Err(ApiError::bad(format!(
+            "已有接口发布记录 #{}，请到发布记录核查或继续上架，避免重复创建", t.id
+        )));
+    }
     validate_copy(&input.title, &input.description)?;
     if input.user_name.trim().is_empty()
         || input.channel_cat_id.trim().is_empty()
@@ -696,12 +727,6 @@ async fn publish_book(
                     crate::commerce::capability()["message"].as_str().unwrap(),
                 ));
             }
-        }
-        let existing: Option<i64> = conn.query_row("SELECT id FROM xianyu_tasks WHERE book_id=? AND app_key=? AND user_name=? AND (product_id<>'' OR status IN ('preparing','unknown')) ORDER BY id DESC LIMIT 1", params![book_id,cfg.app_key,input.user_name], |r| r.get(0)).optional()?;
-        if let Some(id) = existing {
-            return Err(ApiError::bad(format!(
-                "已有接口发布记录 #{id}，请到发布记录核查或继续上架，避免重复创建"
-            )));
         }
         (
             db::get_book(&conn, book_id)?.ok_or_else(|| ApiError::bad("图书不存在"))?,
@@ -1042,17 +1067,25 @@ async fn resume_publish(
         .try_lock()
         .map_err(|_| ApiError::bad("已有操作执行中"))?;
     let cfg = config(&state)?;
-    let before = task(&state, id, &cfg.app_key)?;
+    continue_publish(&state, &cfg, id).await?;
+    Ok(Json(json!(task(&state, id, &cfg.app_key)?)))
+}
+
+async fn continue_publish(state: &AppState, cfg: &ConfigInput, id: i64) -> Result<(), ApiError> {
+    let before = task(state, id, &cfg.app_key)?;
     if before.status == "publishing" {
         return Err(ApiError::bad("上架处理中，请先刷新核查"));
     }
-    refresh(&state, &cfg, id).await?;
-    let t = task(&state, id, &cfg.app_key)?;
+    refresh(state, cfg, id).await?;
+    let t = task(state, id, &cfg.app_key)?;
+    if t.status == "published" {
+        return Ok(());
+    }
     if !["created", "offline", "failed"].contains(&t.status.as_str()) || t.product_id.is_empty() {
         return Err(ApiError::bad("当前状态不可重复上架，请核查远端结果"));
     }
-    submit_publish(&state, &cfg, id).await?;
-    Ok(Json(json!(task(&state, id, &cfg.app_key)?)))
+    submit_publish(state, cfg, id).await?;
+    Ok(())
 }
 async fn verify_images(
     State(state): State<AppState>,

@@ -54,9 +54,9 @@ pub(super) fn tools() -> Vec<Value> {
     };
     let book_input = schema(
         with(
-            json!({"title":string(),"author":string(),"publisher":string(),"isbn":string(),"edition":string(),"volume":string(),"publicationYear":string()}),
+            json!({"title":string(),"author":string(),"publisher":string(),"isbn":string(),"edition":string(),"volume":string(),"publicationYear":string(),"textbookLevel":string(),"applicableMajor":string(),"category":string()}),
         ),
-        &["source", "externalId", "sourceUrl", "title", "edition"],
+        &["source", "externalId", "sourceUrl", "title"],
     );
     let mut lookup=tool("taoshu_lookup_isbn","按书名从豆瓣建议接口查询版本候选，并提取详情页 ISBN；可指定数字 subjectId，结果不自动写入书库。带缓存及限频，受限时返回准确状态。",schema(json!({"query":string(),"subjectId":string()}),&[]),true);
     lookup["annotations"]["openWorldHint"] = json!(true);
@@ -65,11 +65,12 @@ pub(super) fn tools() -> Vec<Value> {
     vec![
         tool("taoshu_context","查询淘书工坊导入约定与可用能力，不包含订单或凭据。",schema(json!({}),&[]),true),
         tool("taoshu_search_books","按书名、ISBN、作者查询已有版本，仅返回公开书目字段。",schema(json!({"query":string()}),&["query"]),true),
-        tool("taoshu_import_book","导入有来源证据的图书版本。严格核对 ISBN、版次、册次，保留既有图书，不覆盖报价、库存或销售数据。",book_input.clone(),false),
+        tool("taoshu_import_book","导入有来源证据的图书版本。版次选填，未知时省略或留空；支持第一版等文本。核对已知 ISBN、版次、册次，保留既有图书，不覆盖报价、库存或销售数据。",book_input.clone(),false),
         tool("taoshu_import_books","批量入库 1–200 本有来源依据的图书。逐条事务、版本去重及幂等，返回每条 bookId 或失败原因；一条失败不回滚其他图书。",schema(json!({"books":{"type":"array","minItems":1,"maxItems":200,"items":book_input}}),&["books"]),false),
+        tool("taoshu_append_book_classifications","为已有图书追加教材分类，1–200条。每条按 bookId 或原导入 source+externalId 定位，sourceUrl 必填；可传 isbn/edition/volume 校验身份。只追加分类，不新建图书，不改原导入回执、价格、库存、货源、图片。重复分类返回 unchanged。",schema(json!({"books":{"type":"array","minItems":1,"maxItems":200,"items":schema(json!({"bookId":{"type":"integer","minimum":1},"source":string(),"externalId":string(),"sourceUrl":string(),"isbn":string(),"edition":string(),"volume":string(),"textbookLevel":string(),"applicableMajor":string(),"category":string()}),&["sourceUrl"])}}),&["books"]),false),
         lookup,
         generate,
-        tool("taoshu_import_school_book","将已有图书版本关联到学校、年份、专业及官方用书引用。",schema(with(json!({"bookId":{"type":"integer","minimum":1},"school":string(),"year":{"type":"integer","minimum":2000,"maximum":2200},"major":string(),"college":string(),"majorCode":string(),"subject":string(),"stage":string(),"raw":string(),"edition":string(),"volume":string()})),&["source","externalId","sourceUrl","bookId","school","year","major","raw","edition"]),false),
+        tool("taoshu_import_school_book","将已有图书版本关联到学校、年份、专业及官方用书引用。",schema(with(json!({"bookId":{"type":"integer","minimum":1},"school":string(),"year":{"type":"integer","minimum":2000,"maximum":2200},"major":string(),"college":string(),"majorCode":string(),"subject":string(),"stage":string(),"raw":string(),"edition":string(),"volume":string()})),&["source","externalId","sourceUrl","bookId","school","year","major","raw"]),false),
         tool("taoshu_import_source","向指定图书导入货源候选；不覆盖已核验报价，不推断运费与代发。",schema(with(json!({"bookId":{"type":"integer","minimum":1},"url":string(),"title":string(),"shop":string(),"sku":string(),"condition":string(),"price":{"type":["number","null"],"minimum":0},"freight":{"type":["number","null"],"minimum":0}})),&["source","externalId","sourceUrl","bookId","url"]),false),
         tool("taoshu_import_image","向指定图书上传实际 PNG/JPEG/WebP 图片的 Base64，最多 10MB。不读取本机文件，不代抓远程网址。",schema(with(json!({"bookId":{"type":"integer","minimum":1},"base64":string(),"mimeType":{"type":"string","enum":["image/png","image/jpeg","image/webp"]}})),&["source","externalId","sourceUrl","bookId","base64","mimeType"]),false),
     ]

@@ -175,13 +175,13 @@ onMounted(refresh);
                 author: '作者',
                 publisher: '出版社',
                 isbn: 'ISBN',
-                edition: '版次',
+                edition: '版次（选填）',
                 condition: '品相',
               }"
               :key="key"
               class="field"
               ><span>{{ label }}</span
-              ><input v-model="form[key]" class="input" /></label
+              ><input v-model="form[key]" class="input" :placeholder="key === 'edition' ? '例如：第一版、第2版' : undefined" /></label
             ><label
               v-for="(label, key) in {
                 costPrice: '参考成本',
@@ -195,11 +195,12 @@ onMounted(refresh);
               ><input
                 v-model.number="form[key]"
                 class="input"
-                :readonly="key==='costPrice' && !!business?.profile?.taobaoCostBasis"
-                :title="key==='costPrice' && business?.profile?.taobaoCostBasis ? '淘宝第二低商品价，不含运费' : undefined"
+                :readonly="key==='costPrice'"
+                :title="key==='costPrice' ? '随主选货源采购单价更新，不含运费；请在货源页修改' : undefined"
+                :placeholder="key==='costPrice' ? '待选择主选货源' : undefined"
                 type="number"
                 min="0"
-                :step="key === 'stock' ? 1 : 0.01" /></label
+                :step="key === 'stock' ? 1 : 0.01" /><small v-if="key==='costPrice'" class="muted">随主选货源采购单价更新，不含运费</small></label
             ><label class="field wide"
               ><span>备注</span
               ><textarea v-model="form.note" class="input" rows="3" />
@@ -210,6 +211,12 @@ onMounted(refresh);
               保存资料</button>
           </div>
         </form>
+        <section v-if="book.textbookClassifications?.length" class="detail-section">
+          <h3>教材分类</h3>
+          <table class="data-table"><thead><tr><th>教材分级</th><th>适用专业</th><th>类别</th></tr></thead>
+            <tbody><tr v-for="(c, i) in book.textbookClassifications" :key="i"><td>{{ c.textbookLevel || '未填写' }}</td><td>{{ c.applicableMajor || '未填写' }}</td><td>{{ c.category || '未填写' }}</td></tr></tbody>
+          </table>
+        </section>
         <details class="detail-section">
           <summary>版本核对</summary>
           <BookOperations

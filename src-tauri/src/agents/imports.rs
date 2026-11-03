@@ -59,7 +59,9 @@ fn identity(
     let prior = match prior {
         Some((h, result)) => {
             if h != hash {
-                return Err("该外部编号已导入不同内容，请核对来源或使用新的修订编号".into());
+                return Err(if tool == "taoshu_import_book" {
+                    "该外部编号已导入不同内容；若仅补教材分类，请使用 taoshu_append_book_classifications 沿用原 source、externalId；其他变更请核对来源或使用新的修订编号"
+                } else { "该外部编号已导入不同内容，请核对来源或使用新的修订编号" }.into());
             }
             let mut r: Value = serde_json::from_str(&result).map_err(err)?;
             if let Some(id) = r["bookId"].as_i64() {
@@ -140,6 +142,7 @@ fn save_profile(c: &Connection, id: i64, v: &Value) -> Result<()> {
     Ok(())
 }
 pub(super) fn execute(s: &AppState, tool: &str, v: &Value) -> Result<Value> {
+    if tool == "taoshu_append_book_classifications" { return append_classifications(s,v); }
     if tool=="taoshu_generate_draft"{return super::ai::mcp_request(s,v);}
     if tool == "taoshu_import_books" {
         return batch(s, v);
@@ -149,7 +152,7 @@ pub(super) fn execute(s: &AppState, tool: &str, v: &Value) -> Result<Value> {
     }
     if tool == "taoshu_context" {
         return Ok(
-            json!({"application":"淘书工坊","version":env!("CARGO_PKG_VERSION"),"importTypes":["book","schoolBook","source","image"],"lookup":"taoshu_lookup_isbn 按书名查豆瓣候选，按 subjectId 获取指定版本 ISBN；不自动修改书库","ai":"taoshu_generate_draft 创建 AI 定价、文案或文本任务并查询结果；自动写入本地草稿，不选择货源或发布","costRule":"淘宝有效商品价按不同价位去重，取第二低价，不含运费；不足两档则待补充","identity":"每次导入提供 source、externalId；重试保留原参数","limits":{"imageBytes":10485760,"searchResults":50,"batchBooks":200,"aiBooks":100},"scope":"图书资料查询、导入及本地 AI 草稿；不提供订单、支付、发布、发货或密钥接口"}),
+            json!({"application":"淘书工坊","version":env!("CARGO_PKG_VERSION"),"importTypes":["book","schoolBook","source","image"],"lookup":"taoshu_lookup_isbn 按书名查豆瓣候选，按 subjectId 获取指定版本 ISBN；不自动修改书库","ai":"taoshu_generate_draft 创建 AI 定价、文案或文本任务并查询结果；自动写入本地草稿，不选择货源或发布","costRule":"使用用户保存的主选货源采购单价，不含运费；未选择主选货源或采购价无效则待补充","classificationUpdate":"taoshu_append_book_classifications 按原 source+externalId 或 bookId 为已有图书追加分类，不受原导入内容哈希限制，不新建图书，不改变经营数据","identity":"每次导入提供 source、externalId；重试保留原参数","limits":{"imageBytes":10485760,"searchResults":50,"batchBooks":200,"aiBooks":100},"scope":"图书资料查询、导入及本地 AI 草稿；不提供订单、支付、发布、发货或密钥接口"}),
         );
     }
     if tool == "taoshu_search_books" {
@@ -164,6 +167,7 @@ pub(super) fn execute(s: &AppState, tool: &str, v: &Value) -> Result<Value> {
         for row in &mut rows {
             let p = profile(&c, row["bookId"].as_i64().unwrap())?;
             row["volume"] = p["volume"].clone();
+            row["textbookClassifications"] = json!(db::get_book(&c,row["bookId"].as_i64().unwrap()).map_err(err)?.unwrap().textbook_classifications);
         }
         return Ok(json!({"items":rows,"limit":50}));
     }
@@ -192,9 +196,6 @@ pub(super) fn execute(s: &AppState, tool: &str, v: &Value) -> Result<Value> {
             let volume = text(v, "volume");
             let author = text(v, "author");
             let publisher = text(v, "publisher");
-            if edition.is_empty() {
-                return Err("请提供来源明确的版次；未知版次不能自动建档".into());
-            }
             let candidates: Vec<i64> = {
                 let mut stmt=tx.prepare("SELECT id FROM books WHERE (?1<>'' AND isbn=?1) OR (?1='' AND title=?2 AND author=?3 AND publisher=?4)").map_err(err)?;
                 let values = stmt
@@ -236,6 +237,8 @@ pub(super) fn execute(s: &AppState, tool: &str, v: &Value) -> Result<Value> {
                 db::create_book(&tx, &patch).map_err(err)?.id
             };
             let mut p = profile(&tx, id)?;
+            let classification: BookPatch = serde_json::from_value(json!({"textbookLevel":text(v,"textbookLevel"),"applicableMajor":text(v,"applicableMajor"),"category":text(v,"category")})).map_err(err)?;
+            db::save_textbook_classification(&tx,id,&classification).map_err(err)?;
             p["volume"] = json!(volume);
             if !text(v, "publicationYear").is_empty() {
                 let year = text(v, "publicationYear");
@@ -371,6 +374,48 @@ pub(super) fn execute(s: &AppState, tool: &str, v: &Value) -> Result<Value> {
     Ok(result)
 }
 
+pub(super) fn append_classifications(s: &AppState, input: &Value) -> Result<Value> {
+    let fields = input.as_object().ok_or("参数应为对象")?;
+    if fields.keys().any(|k| k != "books") { return Err("仅支持 books 参数".into()); }
+    let books = input["books"].as_array().filter(|b| !b.is_empty() && b.len() <= 200).ok_or("每批须为 1–200 条分类补录")?;
+    let mut items = Vec::new();
+    let (mut added, mut unchanged, mut failed) = (0,0,0);
+    for (index, v) in books.iter().enumerate() {
+        let result = (|| -> Result<Value> {
+            let fields = v.as_object().ok_or("补录条目应为对象")?;
+            for (key,value) in fields {
+                if !["bookId","source","externalId","sourceUrl","isbn","edition","volume","textbookLevel","applicableMajor","category"].contains(&key.as_str()) { return Err(format!("分类补录不支持字段 {key}")); }
+                if key != "bookId" && (!value.is_string() || value.as_str().is_some_and(|s|s.len()>3000)) { return Err(format!("{key} 须为不超过 3000 字节的文本")); }
+            }
+            let source_url = web(v,"sourceUrl")?;
+            let mut c = lock(s);let tx=c.transaction().map_err(err)?;
+            let explicit = if fields.contains_key("bookId") { Some(bid(v)?) } else { None };
+            let mapped = if fields.contains_key("source") || fields.contains_key("externalId") {
+                let source=required(v,"source")?;let external=required(v,"externalId")?;
+                let raw: String = tx.query_row("SELECT result FROM agent_imports WHERE tool='taoshu_import_book' AND source=? AND external_id=?",params![source,external],|r|r.get(0)).optional().map_err(err)?.ok_or("未找到原导入记录；分类补录不会新建图书")?;
+                Some(serde_json::from_str::<Value>(&raw).map_err(err)?["bookId"].as_i64().filter(|id|*id>0).ok_or("原导入记录缺少有效 bookId")?)
+            } else { None };
+            if explicit.zip(mapped).is_some_and(|(a,b)| a!=b) { return Err("bookId 与原导入记录不一致".into()); }
+            let id=explicit.or(mapped).ok_or("请提供 bookId 或原 source、externalId")?;
+            let book=db::get_book(&tx,id).map_err(err)?.ok_or("原图书不存在或已删除；分类补录不会新建图书")?;
+            if fields.contains_key("isbn") && isbn(text(v,"isbn"))? != isbn(&book.isbn)? { return Err("ISBN 与已有图书不一致".into()); }
+            if fields.contains_key("edition") && text(v,"edition") != book.edition { return Err("版次与已有图书不一致".into()); }
+            if fields.contains_key("volume") && text(v,"volume") != text(&profile(&tx,id)?,"volume") { return Err("册次与已有图书不一致".into()); }
+            let patch: BookPatch=serde_json::from_value(json!({"textbookLevel":text(v,"textbookLevel"),"applicableMajor":text(v,"applicableMajor"),"category":text(v,"category")})).map_err(err)?;
+            if [text(v,"textbookLevel"),text(v,"applicableMajor"),text(v,"category")].iter().all(|s|s.is_empty()) { return Err("至少填写一个分类字段".into()); }
+            db::save_textbook_classification(&tx,id,&patch).map_err(err)?;
+            let added=tx.changes()>0;
+            if added { crate::commerce::event(&tx,"book",id,"append-textbook-classification",&json!({"sourceUrl":source_url,"source":v["source"],"externalId":v["externalId"],"textbookLevel":patch.textbook_level,"applicableMajor":patch.applicable_major,"category":patch.category})).map_err(err)?; }
+            let classifications=db::get_book(&tx,id).map_err(err)?.unwrap().textbook_classifications;
+            tx.commit().map_err(err)?;
+            Ok(json!({"bookId":id,"status":if added{"appended"}else{"unchanged"},"textbookClassifications":classifications}))
+        })();
+        let mut row=match result { Ok(r)=>{if r["status"]=="appended" {added+=1;}else{unchanged+=1;}r},Err(e)=>{failed+=1;json!({"status":"failed","error":e})} };
+        row["index"]=json!(index+1);row["externalId"]=v["externalId"].clone();items.push(row);
+    }
+    Ok(json!({"total":books.len(),"success":added+unchanged,"appended":added,"unchanged":unchanged,"failed":failed,"items":items}))
+}
+
 pub(super) fn batch(s: &AppState, v: &Value) -> Result<Value> {
     let fields = v.as_object().ok_or("批量参数应为对象")?;
     if fields.keys().any(|k| k != "books") {
@@ -397,6 +442,9 @@ pub(super) fn batch(s: &AppState, v: &Value) -> Result<Value> {
                     "edition",
                     "volume",
                     "publicationYear",
+                    "textbookLevel",
+                    "applicableMajor",
+                    "category",
                 ]
                 .contains(&key.as_str())
                 {

@@ -79,6 +79,7 @@ export const api = {
   saveGiteeConfig: (body) => request('/api/xianyu/gitee/config', { method: 'PUT', body }),
   testGitee: () => request('/api/xianyu/gitee/test', { method: 'POST' }),
   xianyuConfig: () => request('/api/xianyu/config'),
+  xianyuBookTasks: (id) => request(`/api/xianyu/books/${id}/publish`),
   saveXianyuConfig: (body) => request('/api/xianyu/config', { method: 'PUT', body }),
   xianyuCall: (operation, body = {}) =>
     request('/api/xianyu/call/' + operation, { method: 'POST', body }),
@@ -170,7 +171,8 @@ export function searchUrl(base, book) {
 export function taobaoSourceUrl(book) {
   const query = book.isbn || [book.title, book.author, book.edition].filter(Boolean).join(' ');
   const url = new URL('https://s.taobao.com/search');
-  url.searchParams.set('q', query);
+  url.searchParams.set('q', query.trim());
+  url.searchParams.set('sort', 'price-asc');
   url.searchParams.set('taoshuSourceBook', String(book.id));
   return url.href;
 }

@@ -1,5 +1,6 @@
 <script setup>
-import { computed, nextTick, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, onBeforeUnmount, ref } from "vue";
+import { sourceBatchLauncher } from './source-batch';
 import {
   BookOpen,
   Store,
@@ -24,6 +25,8 @@ import QoderPage from "./components/redesign/QoderPage.vue";
 import "./commerce.css";
 
 const toast = useToast();
+const launchSourceBatch = sourceBatchLauncher(api, openBrowser);
+let batchTimer;
 const active = ref("xianyu"),
   visited = ref(new Set(["xianyu"])),
   ready = ref(false),
@@ -42,7 +45,7 @@ const library = ref(null),
 const navigation = [
   { id: "xianyu", name: "闲管家", icon: Store },
   { id: "books", name: "图书", icon: BookOpen },
-  { id: "collect", name: "采集", icon: Download },
+  { id: "collect", name: "任务", icon: Download },
   { id: "opencode", name: "OpenCode", icon: Bot },
   { id: "qoder", name: "Qoder CLI", icon: Bot },
   { id: "settings", name: "设置", icon: Settings },
@@ -71,6 +74,8 @@ async function bootstrap() {
     await initApi();
     settings.value = await api.settings();
     ready.value = true;
+    clearInterval(batchTimer);
+    batchTimer = setInterval(() => launchSourceBatch().catch(e => { error.value = e.message; }), 2000);
   } catch (e) {
     error.value = e.message;
   } finally {
@@ -186,6 +191,7 @@ async function settingsUpdated() {
   await commerce.value?.reconnect();
 }
 onMounted(bootstrap);
+onBeforeUnmount(() => clearInterval(batchTimer));
 </script>
 <template>
   <div class="studio-app">
