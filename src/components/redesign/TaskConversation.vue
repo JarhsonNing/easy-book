@@ -10,6 +10,12 @@ let timer, version = 0;
 const running = computed(() => ["queued", "running"].includes(props.job.state));
 const time = value => new Date(value).toLocaleString("zh-CN");
 const fields = { analysis: "分析与建议", text: "回复", title: "商品标题", description: "商品描述", sellPrice: "建议售价（元）", referenceSourceId: "参考货源编号", recommendedSourceId: "推荐货源编号", backupSourceIds: "备用货源编号", sources: "货源比较" };
+function executionStatus(run) {
+  const execution = run.execution;
+  if (!execution?.pid) return run.stdout?.bytes > 0 ? "已有输出，历史记录未保存进程号" : "未记录 CLI 启动结果";
+  if (execution.status === "exited") return `已退出（退出码 ${execution.exitCode ?? '未知'}）`;
+  return { running: "已记录启动，尚无退出记录", canceled: "已停止", timed_out: "超时停止", management_failed: "进程管理失败", wait_failed: "进程状态读取失败" }[execution.status] || execution.status;
+}
 function replyBlocks(text) {
   try {
     const clean = text.trim().replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
@@ -76,6 +82,14 @@ onBeforeUnmount(() => { version++; clearTimeout(timer); });
     </template>
     <article v-for="(run, index) in data?.runs || []" :key="run.id" class="conversation-run">
       <p class="muted conversation-time">执行记录 {{ index + 1 }} · {{ time(run.createdAt) }}</p>
+      <dl class="cli-record" aria-label="CLI 执行状态">
+        <div><dt>CLI 调用</dt><dd>{{ executionStatus(run) }}</dd></div>
+        <div v-if="run.execution?.pid"><dt>启动进程号</dt><dd>{{ run.execution.pid }}</dd></div>
+        <div v-if="run.execution?.startedAt"><dt>启动时间</dt><dd>{{ time(run.execution.startedAt) }}</dd></div>
+        <div v-if="run.execution?.finishedAt"><dt>退出时间</dt><dd>{{ time(run.execution.finishedAt) }}</dd></div>
+        <div><dt>标准输出 / 错误输出</dt><dd>{{ run.stdout?.bytes ?? 0 }} / {{ run.stderr?.bytes ?? 0 }} 字节</dd></div>
+        <div v-if="run.stdout?.updatedAt"><dt>输出更新时间</dt><dd>{{ time(run.stdout.updatedAt) }}</dd></div>
+      </dl>
       <div class="conversation-message">
         <h4>本次提示词</h4>
         <pre>{{ run.prompt || '未记录提示词' }}</pre>
@@ -102,6 +116,9 @@ onBeforeUnmount(() => { version++; clearTimeout(timer); });
 
 <style scoped>
 .task-conversation { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); min-width: 0; }
+.cli-record { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; padding: 16px 0; border-block: 1px solid var(--line); }
+.cli-record dt { color: var(--muted); margin-bottom: 4px; }
+.cli-record dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .conversation-book { max-width: 480px; margin-bottom: 16px; }
 .conversation-run + .conversation-run { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
 .conversation-time { margin-bottom: 12px; }

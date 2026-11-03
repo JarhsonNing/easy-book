@@ -547,12 +547,22 @@ pub(super) fn command(
     }
     let prompt = if engine == "qoder" && job.is_some() { Some(fs::read(dir.join("input.txt")).map_err(|e|e.to_string())?) } else { None };
     let mut child = cmd.spawn().map_err(|_| format!("{} 无法启动，请重新检测程序", if engine == "qoder" { "Qoder CLI" } else { "OpenCode" }))?;
+    let pid = child.id();
+    let started_at = db::now();
+    let record = |status: &str, exit_code: Option<i32>| {
+        let _ = fs::write(dir.join("execution.json"), json!({
+            "provider":engine,"pid":pid,"startedAt":started_at,"status":status,
+            "finishedAt":if status == "running" { None } else { Some(db::now()) },"exitCode":exit_code
+        }).to_string());
+    };
+    record("running", None);
     #[cfg(windows)]
     let _job = match web::ProcessJob::attach(&child) {
         Ok(j) => j,
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
+            record("management_failed", None);
             return Err(format!("无法管理 AI 进程：{e}"));
         }
     };
@@ -572,6 +582,7 @@ pub(super) fn command(
         }) {
             let _ = child.kill();
             let _ = child.wait();
+            record("canceled", None);
             return Ok(None);
         }
         if start.elapsed() > Duration::from_secs(if job.is_some() { 300 } else { 25 })
@@ -580,9 +591,20 @@ pub(super) fn command(
         {
             let _ = child.kill();
             let _ = child.wait();
+            record("timed_out", None);
             return Err("AI 执行超时或输出过大，请缩短提示词后重试".into());
         }
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                record("wait_failed", None);
+                return Err(e.to_string());
+            }
+        };
+        if let Some(status) = status {
+            record("exited", status.code());
             let output = fs::read_to_string(&out).map_err(|e| e.to_string())?;
             if !status.success() {
                 return Err(provider_error_for(engine,

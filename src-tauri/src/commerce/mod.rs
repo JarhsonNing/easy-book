@@ -31,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/commerce/library", get(library::list))
         .route("/api/commerce/catalog/sync", post(library::sync_catalog))
         .route("/api/commerce/jobs", get(jobs::list).post(jobs::create))
+        .route("/api/commerce/jobs/page", get(jobs::page))
         .route("/api/commerce/jobs/{id}", get(jobs::detail))
         .route("/api/commerce/jobs/{id}/conversation", get(jobs::conversation))
         .route("/api/commerce/jobs/{id}/{action}", post(jobs::control))

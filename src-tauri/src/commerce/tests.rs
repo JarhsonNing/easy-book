@@ -3,6 +3,43 @@ use crate::models::{BookPatch, CaptureInput};
 use std::{fs, path::PathBuf};
 
 #[tokio::test]
+async fn task_pages_filter_all_history_and_count_every_state() {
+    let f = Fixture::new();
+    let states = ["completed", "failed", "running", "waiting", "paused", "partial", "canceled", "queued"];
+    {
+        let c = lock(&f.state);
+        for state in states.iter().chain(std::iter::repeat(&"queued").take(125)) {
+            c.execute("INSERT INTO collection_jobs(kind,title,state,request,created_at,updated_at) VALUES('ai','任务',?,'{}','now','now')", [state]).unwrap();
+        }
+    }
+    let query = |v:Value| jobs::page(State(f.state.clone()), axum::extract::Query(serde_json::from_value(v).unwrap()));
+    let all = query(json!({})).await.unwrap().0;
+    assert_eq!(all["total"],133);
+    assert_eq!(all["items"].as_array().unwrap().len(),30);
+    assert!(all["items"].as_array().unwrap().iter().all(|j|j["state"]=="queued"));
+    assert_eq!(all["counts"]["queued"],126);
+    assert_eq!(all["counts"]["all"],133);
+    for state in states {
+        let filtered = query(json!({"state":state})).await.unwrap().0;
+        assert_eq!(filtered["total"], if state == "queued" {126} else {1});
+        assert!(filtered["items"].as_array().unwrap().iter().all(|j|j["state"]==state));
+        assert_eq!(filtered["counts"]["completed"],1);
+    }
+    let last = query(json!({"page":999})).await.unwrap().0;
+    assert_eq!(last["page"],5);
+    assert_eq!(last["items"].as_array().unwrap().len(),13);
+    assert_eq!(last["items"].as_array().unwrap().last().unwrap()["id"],1);
+    let bounded = query(json!({"page":0,"pageSize":1000})).await.unwrap().0;
+    assert_eq!(bounded["page"],1); assert_eq!(bounded["pageSize"],100);
+    assert!(query(json!({"state":"unknown"})).await.is_err());
+    let detail = jobs::detail(State(f.state.clone()),Path(1)).await.unwrap().0;
+    assert_eq!(detail["state"],"completed");
+    let empty = Fixture::new();
+    let result = jobs::page(State(empty.state.clone()),axum::extract::Query(serde_json::from_value(json!({"state":"completed","page":99})).unwrap())).await.unwrap().0;
+    assert_eq!(result["total"],0); assert_eq!(result["page"],1); assert_eq!(result["counts"]["queued"],0);
+}
+
+#[tokio::test]
 async fn textbook_classifications_filter_together_and_keep_facets_outside_the_page() {
     let f=Fixture::new();
     let (a,b,blank)={

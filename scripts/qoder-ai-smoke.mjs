@@ -55,6 +55,14 @@ try{
   assert.equal(conversation.runs.length,1);assert.equal(conversation.runs[0].prompt,completed.request.prompt);
   assert.match(conversation.runs[0].input,/模拟 · Qoder 图书/);assert.match(conversation.runs[0].system,/成本固定取/);
   assert.deepEqual(JSON.parse(conversation.runs[0].reply),answer);
+  assert.equal(conversation.runs[0].execution.status,'exited');
+  assert.equal(conversation.runs[0].execution.exitCode,0);
+  assert.ok(conversation.runs[0].execution.pid>0);
+  assert.ok(conversation.runs[0].execution.startedAt);
+  assert.ok(conversation.runs[0].execution.finishedAt);
+  assert.ok(conversation.runs[0].stdout.bytes>0);
+  const completedPage=await api('/commerce/jobs/page?state=completed&page=1&pageSize=1');
+  assert.equal(completedPage.items[0].state,'completed');assert.ok(completedPage.counts.completed>0);
   const wrongBook=await fetch(`${base}/api/commerce/jobs/${complete.id}/conversation?bookId=999999`,{headers:{'x-kf-token':token}});assert.equal(wrongBook.status,400);
   assert.equal((await fetch(`${base}/api/commerce/jobs/${complete.id}/conversation?bookId=${book.id}`)).status,401);
   const draft=(await api('/agents/ai/books/'+book.id+'/draft')).draft;assert.equal(draft.provider,'qoder');assert.equal(draft.model,'Fixture-Qoder');assert.equal(draft.title,answer.title);assert.equal(draft.sellPrice,17);
@@ -65,11 +73,13 @@ try{
   const held=await api('/commerce/jobs','POST',{kind:'ai',bookIds:[book.id],task:'text',prompt:'pause-and-resume'});
   await until(async()=> (await lastCall())?.prompt.includes('pause-and-resume'),'held Qoder prompt');
   const live=await api(`/commerce/jobs/${held.id}/conversation?bookId=${book.id}`);assert.equal(live.runs.length,1);assert.equal(live.runs[0].reply,'');assert.match(live.runs[0].input,/pause-and-resume/);
+  assert.equal(live.runs[0].execution.status,'running');assert.ok(live.runs[0].execution.pid>0);
   await api('/commerce/jobs/'+held.id+'/pause','POST',{});
   config.provider='opencode';config.model='fixture/writer';config=await api('/agents/ai/config','POST',config);
   await fs.unlink(path.join(root,'hold'));await api('/commerce/jobs/'+held.id+'/resume','POST',{});
   const resumed=await finished(held.id);assert.equal(resumed.state,'completed',JSON.stringify(resumed));assert.equal(resumed.request.provider,'qoder');assert.equal(resumed.request.model,'Fixture-Qoder');
   const attempts=await api(`/commerce/jobs/${held.id}/conversation?bookId=${book.id}`);assert.equal(attempts.runs.length,2);assert.ok(attempts.runs.some(run=>run.reply.includes(answer.text)));
+  assert.ok(attempts.runs.some(run=>run.execution.status==='canceled'));
   const revision=(await api('/agents/ai/books/'+book.id+'/draft')).draft.revision;
   await fs.writeFile(path.join(root,'error'),'');
   const broken=await api('/commerce/jobs','POST',{kind:'ai',bookIds:[book.id],provider:'qoder',task:'text'});const failed=await finished(broken.id);assert.equal(failed.state,'failed');assert.match(failed.result.items[0].error,/额度/);assert.ok(!JSON.stringify(failed).includes('fixture-secret'));assert.equal((await api('/agents/ai/books/'+book.id+'/draft')).draft.revision,revision);

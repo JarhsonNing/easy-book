@@ -349,6 +349,7 @@ node scripts/smoke.mjs
 - 开启 MCP 导入后会生成两个 Agent 的项目配置与 `taoshu-import`、`taoshu-workflow` Skills。Qoder 使用项目 `.mcp.json` 和 `.qoder/skills/`，通过 `--strict-mcp-config` 加载项目指定的 MCP；首次启动按终端提示登录。
 - Qoder 专用版采用[官方安装脚本](https://docs.qoder.com/zh/cli/installation)引用的原生发行源，校验官方 SHA-256 后提取程序；[CLI 参数文档](https://docs.qoder.com/zh/cli/cli-reference)说明 `--cwd` 等选项。
 - 「AI 流程」可选择 OpenCode 或 Qoder CLI，并分别保存模型；单本或批量“AI 完善”可覆盖本次执行器和模型。自动任务使用保存的默认值，任务创建后冻结执行器和模型，暂停、继续及重试均沿用原配置。复制命令和 MCP `taoshu_generate_draft` 同样支持 `provider: "opencode" | "qoder"`、`model`。
+- 「任务」列表显示任务号，支持全部 8 种状态的全库筛选与分页（每页 30 条）。「按号核查」和「查看详情」直接读取后台记录，在详情弹窗显示状态、进度、更新时间和单本错误；列表与已打开的详情自动更新，关闭后保留列表位置。AI 对话中显示 CLI 启动进程号、启动/退出时间、退出码及日志字节数；旧记录没有进程信息时如实标注。进程号属于启动记录，不作为进程仍存活的证明。
 - Qoder 登录状态由 `status -o json` 查询，界面只返回是否登录，不暴露账户标识或凭据。“登录 Qoder”在固定目录打开官方 `login` 流程，无需先开启 MCP；完成后自动刷新登录状态与模型。交互终端使用 AI 流程中保存的 Qoder 模型，重新打开后生效。
 - 两个执行器生成自动草稿时均禁用工具；Qoder 使用非交互 JSON 输出、标准输入传递图书证据，并禁用 MCP 与 Hooks。此处固定的是应用启动的项目目录，并非操作系统沙箱；交互终端的文件访问仍由各 CLI 的权限规则管理。
 

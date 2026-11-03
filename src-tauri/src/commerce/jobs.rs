@@ -8,6 +8,41 @@ use std::{
 };
 
 const SELECT: &str="SELECT json_object('id',id,'kind',kind,'title',title,'state',state,'stage',stage,'request',json(request),'result',json(result),'error',error,'processed',processed,'total',total,'createdAt',created_at,'updatedAt',updated_at) FROM collection_jobs";
+const STATES: &[&str] = &["queued", "running", "waiting", "paused", "completed", "partial", "failed", "canceled"];
+
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PageFilter {
+    #[serde(default)]
+    state: String,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+pub(super) async fn page(
+    State(s): State<AppState>,
+    axum::extract::Query(f): axum::extract::Query<PageFilter>,
+) -> Result<Json<Value>, ApiError> {
+    if !f.state.is_empty() && !STATES.contains(&f.state.as_str()) {
+        return Err(ApiError::bad("未知任务状态"));
+    }
+    let c = lock(&s);
+    let size = f.page_size.unwrap_or(30).clamp(1, 100);
+    let total: i64 = c.query_row(
+        "SELECT count(*) FROM collection_jobs WHERE (?1='' OR state=?1)",
+        [&f.state], |r| r.get(0),
+    )?;
+    let page = f.page.unwrap_or(1).max(1).min(((total + size - 1) / size).max(1));
+    let items = rows(&c, &format!("{SELECT} WHERE (?1='' OR state=?1) ORDER BY id DESC LIMIT ?2 OFFSET ?3"),
+        params![f.state, size, (page - 1) * size])?;
+    let mut counts = json!({"all":0});
+    for state in STATES { counts[*state] = json!(0); }
+    for row in rows(&c,"SELECT json_object('state',state,'count',count(*)) FROM collection_jobs GROUP BY state",[])? {
+        counts[text(&row,"state")] = row["count"].clone();
+        counts["all"] = json!(counts["all"].as_i64().unwrap_or(0) + row["count"].as_i64().unwrap_or(0));
+    }
+    Ok(Json(json!({"items":items,"total":total,"page":page,"pageSize":size,"counts":counts})))
+}
 fn get(c: &Connection, id: i64) -> Result<Value, ApiError> {
     rows(c, &format!("{SELECT} WHERE id=?"), [id])?
         .pop()

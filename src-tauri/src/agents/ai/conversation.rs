@@ -19,6 +19,13 @@ fn read_text(path: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+fn log_info(path: &Path) -> Value {
+    match fs::metadata(path) {
+        Ok(meta) => json!({"bytes":meta.len(),"updatedAt":meta.modified().ok().map(|t|chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())}),
+        Err(_) => Value::Null,
+    }
+}
+
 fn reply(output: &str, engine: &str) -> String {
     let mut parts = Vec::new();
     let events = if let Ok(event) = serde_json::from_str::<Value>(output) {
@@ -133,7 +140,10 @@ pub(crate) fn read(s: &AppState, job: &Value, bid: i64) -> Result<Value, String>
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339());
+        let execution = read_text(&dir.join("execution.json")).ok()
+            .and_then(|raw|serde_json::from_str::<Value>(&raw).ok()).unwrap_or(Value::Null);
         runs.push(json!({"id":name,"createdAt":created,"prompt":meta["prompt"].as_str().or_else(||job["request"]["prompt"].as_str()),
+            "execution":execution,"stdout":log_info(&dir.join("stdout.ndjson")),"stderr":log_info(&dir.join("stderr.log")),
             "system":system,"input":input.unwrap_or_default(),"reply":reply(&output.unwrap_or_default(),engine),"error":error}));
     }
     Ok(json!({"bookId":bid,"runs":runs,"truncated":truncated}))
@@ -177,6 +187,7 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
+        fs::write(root.join("12-3-2/execution.json"),json!({"pid":42,"status":"exited","exitCode":0,"startedAt":"2026-10-29T00:00:00Z"}).to_string()).unwrap();
         let data = read(&s, &job, 3).unwrap();
         assert_eq!(data["runs"].as_array().unwrap().len(), 2);
         assert!(data["runs"]
@@ -190,6 +201,13 @@ mod tests {
             .iter()
             .any(|r| r["prompt"] == "本次提示词" && r["system"] == "系统规则"));
         assert!(!data.to_string().contains("private-provider-error"));
+        let run = data["runs"].as_array().unwrap().iter().find(|r|r["id"]=="12-3-2").unwrap();
+        assert_eq!(run["execution"]["pid"],42);
+        assert_eq!(run["execution"]["exitCode"],0);
+        assert!(run["stdout"]["bytes"].as_u64().unwrap()>0);
+        assert!(run["stdout"]["updatedAt"].is_string());
+        assert!(run["stderr"]["bytes"].as_u64().unwrap()>0);
+        assert!(data["runs"].as_array().unwrap().iter().any(|r|r["execution"].is_null()));
         assert!(read(&s, &job, 4).is_err());
         fs::write(
             root.join("12-3-2/stdout.ndjson"),
